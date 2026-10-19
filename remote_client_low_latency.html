@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="dk-remote-build" content="2026.10.06.1">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Serious Optimization</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;color:#fff}
+#setup{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:20px;background:#090b0e}
+.card{width:min(610px,100%);padding:26px;border:1px solid #293541;border-radius:16px;background:#14191f;box-shadow:0 24px 80px #0008}
+h1{margin:0 0 8px;font-size:29px}p{margin:0 0 14px;color:#aab5c0;line-height:1.4}
+input,select,button{width:100%;margin-top:9px;padding:12px 14px;border-radius:10px;font:inherit}
+input,select{border:1px solid #3a4652;outline:none;background:#090c10;color:#fff}
+label{display:block;margin-top:13px;color:#c1cbd5;font-size:13px;font-weight:600}
+button{border:0;cursor:pointer;font-weight:700;color:#fff;background:#303944}
+#connect{background:#f4f7fa;color:#101318}
+#blank{background:#26313a}
+#setup details{margin-top:16px;color:#aebbc8;font-size:13px}
+#setup .help{font-size:12px;margin:7px 0 4px}
+#audioHint{max-width:250px;padding:9px 12px;border-radius:10px;background:#1b2734;color:#edf5ff;font-size:12px}
+#inputStatus{max-width:250px;color:#bde9ce;font-size:12px;line-height:1.35}
+#status{min-height:20px;margin-top:12px;color:#b2bdc9;font:13px ui-monospace,Consolas,monospace;white-space:pre-wrap}
+#stage{position:fixed;inset:0;outline:none;background:#000}
+#video{display:block;width:100vw;height:100vh;height:100dvh;object-fit:contain;user-select:none;-webkit-user-select:none}
+#video.nativePixels{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%)}
+#fastCanvas{position:fixed;inset:0;display:block;width:100vw;height:100vh;height:100dvh;object-fit:contain;pointer-events:none;background:#000}
+#fastCanvas.nativePixels{inset:auto;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%)}
+#audio{display:none}
+#debug{position:fixed;z-index:40;top:10px;left:10px;width:min(480px,calc(100vw - 20px));max-height:calc(100vh - 20px);overflow:auto;padding:15px 17px;border:1px solid #7382957d;border-radius:12px;background:#0c1219ec;box-shadow:0 16px 40px #0009;font:13px ui-monospace,Consolas,monospace;pointer-events:auto}
+#debug h2{font:700 17px system-ui,sans-serif;margin:0 0 5px}#debug .hint{color:#a8b7c5;margin:0 0 12px;font-size:11px}
+#debug dl{display:grid;grid-template-columns:minmax(150px,1fr) auto;gap:6px 12px;margin:0}
+#debug dt{color:#a9b6c4}#debug dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
+#debug #dModeNote{max-width:240px;overflow-wrap:anywhere;font-size:11px;line-height:1.4}
+#debug #dRate,#debug #dPlayback,#debug #dAudioPlayback{max-width:240px;overflow-wrap:anywhere;font-size:11px;line-height:1.4}
+#debug .section{grid-column:1/-1;border-top:1px solid #39434c;margin:8px 0 1px;padding-top:8px;color:#d9e6f3;font-weight:700}
+#debug .total{font-size:15px;color:#91edbd;font-weight:700}#debug .note{font:11px/1.45 system-ui,sans-serif;color:#9daab6;margin:12px 0 0}
+#controls{position:fixed;z-index:35;top:8px;right:8px;display:flex;gap:6px}#controls button{width:auto;margin:0;padding:7px 11px;font-size:12px;background:#202934da}
+#quickControls{position:fixed;z-index:36;top:8px;right:8px;display:flex;gap:6px}
+#quickControls button{width:auto;height:36px;padding:0 10px;margin:0;border-radius:9px;background:#202934b5;font-size:12px}
+#quickControls #menu{width:36px;padding:0;font-size:21px}
+#gameMouse[aria-pressed="true"]{background:#256846d9}
+#notice{position:fixed;z-index:37;bottom:12px;left:50%;transform:translateX(-50%);max-width:calc(100vw - 24px);padding:8px 12px;background:#142332ed;border-radius:9px;font-size:12px;pointer-events:none;text-align:center}
+#controls{top:50px;flex-direction:column;background:#141d27e8;padding:7px;border-radius:10px}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<input id="clientToken" type="hidden"><div id="setup"><div class="card"><h1>DK Remote</h1><p>Choose the host address and streaming mode, then connect.</p>
+<label for="host">Tunnel address</label><input id="host" placeholder="https://something.trycloudflare.com" autocomplete="off" spellcheck="false">
+<label for="network">Streaming mode</label><select id="network"><option value="stable">Stable quality</option><option value="adaptive">Adaptive bandwidth</option></select>
+<button id="blank">Fullscreen</button>
+<details id="advanced"><summary>More Options</summary><label for="secret">Connection Passcode</label><input id="secret" type="password" placeholder="Paste secret from PC" autocomplete="off"></details>
+<button id="connect">Connect</button>
+<div id="status"></div></div></div>
+<div id="stage" tabindex="0"><video id="video" autoplay muted playsinline></video><audio id="audio" autoplay playsinline></audio></div>
+<div id="quickControls" class="hidden"><button id="gameMouse" aria-label="Toggle mouse lock" aria-pressed="false" title="Lock or unlock the game mouse">Mouse: off</button><button id="menu" aria-label="Open controls" title="Controls">⋮</button></div>
+<div id="notice" role="status" class="hidden"></div>
+<div id="controls" class="hidden"><button id="sound">Sound: on</button><button id="playback">Playback: standard</button><button id="pictureSize">Picture: fit screen</button><button id="diagnostics">Diagnostics</button><button id="autoMouse">Follow Windows mouse: on</button><button id="keyboardSwap">HTML Esc ↔ ~ swap: on</button><label for="scrollSpeed">Scroll speed: <span id="scrollLabel">100%</span></label><input id="scrollSpeed" type="range" min="25" max="200" step="5" value="100" aria-label="Scroll speed"><button id="releaseInput">Release Windows game input</button><button id="fullscreen">Fullscreen</button><button id="disconnect">Disconnect</button><div id="inputStatus" role="status"></div><div id="audioHint" class="hidden"></div></div>
+<section id="debug" class="hidden" aria-label="Connection diagnostics"><h2>DK Remote diagnostics</h2><p class="hint">Press Diagnostics to close. Hold Alt for 1 second to show or hide ⋮ and the mouse-lock button.</p>
+<dl>
+<dt>HTML / Python build</dt><dd id="dBuild">--</dd>
+<div class="section">Video path</div>
+<dt>Capture output</dt><dd id="dCapture">--</dd>
+<dt>Controller screen</dt><dd id="dController">--</dd>
+<dt>Requested → host mode</dt><dd id="dMode">--</dd>
+<dt>Resolution status</dt><dd id="dModeNote">--</dd>
+<dt>Capture / encoder</dt><dd id="dEncoder">--</dd>
+<dt>Encoder burst allowance</dt><dd id="dVbv">--</dd>
+<dt>Playback / decode queue</dt><dd id="dPlayback">--</dd>
+<dt>Sender timeline → receive</dt><dd id="dIngress">--</dd>
+<dt>Network RTT</dt><dd id="dRtt">--</dd>
+<dt>One-way network estimate</dt><dd id="dOneWay">--</dd>
+<dt>Network jitter</dt><dd id="dJitter">--</dd>
+<dt>Host packet queue / skipped</dt><dd id="dQueue">--</dd>
+<dt>Host queue peak / recovery</dt><dd id="dQueuePeak">--</dd>
+<dt>Jitter buffer</dt><dd id="dBuffer">--</dd>
+<dt>Buffer target / minimum</dt><dd id="dBufferTarget">--</dd>
+<dt>Receiver / sender hints</dt><dd id="dBufferHint">--</dd>
+<dt>Audio jitter buffer</dt><dd id="dAudioBuffer">--</dd>
+<dt>Decode</dt><dd id="dDecode">--</dd>
+<dt id="dLocalLabel">Receive → display</dt><dd id="dLocal">--</dd>
+<dt>Sender timeline → display</dt><dd id="dTotal" class="total">--</dd>
+<div class="section">Stream</div>
+<dt>Host send / received FPS</dt><dd id="dSentFps">--</dd>
+<dt>Decoded / presented FPS</dt><dd id="dFps">--</dd>
+<dt>Frame callback FPS</dt><dd id="dCallbacks">--</dd>
+<dt>Resolution</dt><dd id="dResolution">--</dd>
+<dt>Video bitrate</dt><dd id="dBitrate">--</dd><dt>Video budget / mode</dt><dd id="dRate">--</dd>
+<dt>Speaker audio</dt><dd id="dAudio">--</dd><dt>Audio playback / received</dt><dd id="dAudioPlayback">--</dd>
+<dt>Dropped frames</dt><dd id="dDropped">--</dd>
+<dt>Codec / decoder</dt><dd id="dCodec">--</dd>
+<dt>Connection path</dt><dd id="dPath">--</dd>
+<dt>Windows input permission</dt><dd id="dInput">--</dd>
+<dt>Windows mouse capture</dt><dd id="dHostMouse">--</dd>
+<div class="section">Connection setup</div>
+<dt>Signaling / ICE gather</dt><dd id="dSetup">--</dd>
+<dt>WebRTC state</dt><dd id="dState">--</dd>
+</dl><p class="note" id="dNote">The sender timeline is estimated from RTP clock mapping. Capture/encode and upstream buffering are not measured by this FFmpeg pipeline. Input-to-screen latency needs a separate measurement.</p></section>
+<script>
+(function(){"use strict";
+var CLIENT_BUILD="2026.10.06.1";
+var ids=["setup","host","secret","advanced","connect","blank","status","stage","video","audio","audioHint","inputStatus","menu","quickControls","notice","controls","autoMouse","sound","pictureSize","diagnostics","gameMouse","keyboardSwap","scrollSpeed","scrollLabel","releaseInput","fullscreen","disconnect","debug","dCapture","dBuild","dController","dMode","dModeNote","dEncoder","dIngress","dRtt","dOneWay","dJitter","dQueue","dBuffer","dBufferTarget","dBufferHint","dAudioBuffer","dDecode","dLocal","dTotal","dSentFps","dFps","dCallbacks","dResolution","dBitrate","dAudio","dDropped","dCodec","dPath","dInput","dHostMouse","dSetup","dState","dNote"];
+ids.push("dVbv","dQueuePeak","dPlayback","dLocalLabel","playback","dRate","dAudioPlayback","network","clientToken");
+var ui={};ids.forEach(function(id){ui[id]=document.getElementById(id);});
+ui.clientToken.value=ui.clientToken.value||(Date.now().toString(36)+"-"+Math.random().toString(36).slice(2)+Math.random().toString(36).slice(2));ui.clientToken.setAttribute("value",ui.clientToken.value);
+var pc=null,control=null,pointer=null,pingTimer=null,statTimer=null,frameCallback=0;
+var pendingPings={},pingId=0,controlRtt=null,hostInfo=null,metrics={},previous=null,frameCount=0,frameStart=0,renderFps=null;
+var altTimer=null,altHeld=false,altSent=false,pressedKeys={},gameMouse=false,menuSuppressed=false;
+var pointerWasLocked=false,deliberateUnlock=false,lastEscapePulse=-Infinity,escapeDownSeen=false,pressedButtons={};
+var signalingMs=null,iceMs=null,connectStart=null,reconnectTimer=null,wantConnection=false,retryAttempt=0,lastConnectionError="";
+var soundEnabled=true;
+
+var audioContext=null,audioGain=null,audioSource=null,audioPlaybackError="",audioReceived=false;
+var statsInFlight=false,lastDebugUpdate=-Infinity;
+var lastPongAt=0,lastStatsAt=0,lastVideoProgressAt=0,disconnectTimer=null,wakeTimer=null,retryDelay=2000;
+var followWindowsMouse=true,hostMouseLocked=null,autoMouseSuppressed=false,noticeTimer=null;
+var renderFrameBase=null,callbackFps=null,previousAudio=null,receiverHint="unsupported";
+var swapEscapeGrave=true;
+var scrollSpeed=1,wheelPending=null,wheelTimer=null;
+var nativePixels=false,lastRequestedScreen=null;
+// Fast playback is opt-in until tested on this controller. Standard playback
+// remains usable on Chrome versions without encoded streams or WebCodecs.
+var fastPreferred=false,fastBlocked=false,fastWorker=null,fastCanvas=null,fastTimer=null,fastMetrics=null,fastActive=false;
+var fastFailureReason="",fastPhase="waiting for encoded frames";
+var playbackButton=ui.playback;
+function fastSupported(){return typeof Worker!=="undefined"&&typeof VideoDecoder!=="undefined"&&typeof OffscreenCanvas!=="undefined"&&typeof HTMLCanvasElement!=="undefined"&&"transferControlToOffscreen" in HTMLCanvasElement.prototype&&(typeof RTCRtpScriptTransform!=="undefined"||(typeof RTCRtpReceiver!=="undefined"&&"createEncodedStreams" in RTCRtpReceiver.prototype));}
+function playbackUi(){playbackButton.textContent="Playback: "+(fastPreferred&&!fastBlocked?"fast":"standard")+(fastBlocked?" (fallback)":"");}
+playbackUi();
+playbackButton.addEventListener("click",function(){if(!fastPreferred||fastBlocked){if(!fastSupported()){notifyInput("Fast playback needs a newer Chrome with WebCodecs and encoded video streams.");return;}fastPreferred=true;fastBlocked=false;fastFailureReason="";}else{fastPreferred=false;}playbackUi();if(pc){scheduleReconnect("Playback mode changed.");}});
+function pictureDimensions(){return {width:fastMetrics&&fastMetrics.width||ui.video.videoWidth||1280,height:fastMetrics&&fastMetrics.height||ui.video.videoHeight||720};}
+function stopFastPlayback(){if(fastTimer){clearTimeout(fastTimer);fastTimer=null;}if(fastWorker){fastWorker.terminate();fastWorker=null;}if(fastCanvas){fastCanvas.remove();fastCanvas=null;}fastActive=false;fastMetrics=null;fastPhase="waiting for encoded frames";ui.video.style.opacity="";}
+function failFastPlayback(connection,reason){if(connection!==pc||fastBlocked){return;}fastBlocked=true;fastFailureReason=String(reason);playbackUi();notifyInput("Fast playback unavailable: "+reason+". Using standard playback.");scheduleReconnect("Switching to standard playback.");}
+function fastPlaybackWorker(){
+"use strict";
+var decoder=null,reader=null,failed=false,canvas=null,context=null,configuredCodec=null,needKey=true,arrivals=new Map(),lastRtp=null,chunkTime=0;
+var drawn=0,skipped=0,peakQueue=0,periodStart=0,periodFrames=0,decodeSum=0,submitSum=0,acceleration="prefer-hardware";
+var workerPhase="waiting for encoded frames";
+function fail(error){if(failed){return;}failed=true;postMessage({type:"error",error:String(error&&error.message||error)});if(reader){reader.cancel().catch(function(){});}if(decoder&&decoder.state!=="closed"){decoder.close();}}
+function codecFromAnnexB(data){for(var i=0;i+6<data.length;i++){if(data[i]===0&&data[i+1]===0&&data[i+2]===1&&(data[i+3]&31)===7){return "avc1."+Array.from(data.subarray(i+4,i+7)).map(function(b){return b.toString(16).padStart(2,"0");}).join("");}}return null;}
+function output(frame){try{
+var decoded=performance.now(),started=arrivals.get(frame.timestamp);for(var timestamp of arrivals.keys()){if(timestamp<=frame.timestamp){arrivals.delete(timestamp);}else{break;}}
+if(canvas.width!==frame.displayWidth||canvas.height!==frame.displayHeight){canvas.width=frame.displayWidth;canvas.height=frame.displayHeight;}
+context.drawImage(frame,0,0,canvas.width,canvas.height);var submitted=performance.now();drawn++;periodFrames++;
+if(Number.isFinite(started)){decodeSum+=decoded-started;submitSum+=submitted-started;}
+if(drawn===1){postMessage({type:"ready",width:canvas.width,height:canvas.height,acceleration:acceleration});}
+if(submitted-periodStart>=1000){postMessage({type:"stats",width:canvas.width,height:canvas.height,fps:periodFrames*1000/(submitted-periodStart),decode:decodeSum/periodFrames,submit:submitSum/periodFrames,queue:decoder.decodeQueueSize,peakQueue:peakQueue,drawn:drawn,skipped:skipped,acceleration:acceleration});periodStart=submitted;periodFrames=0;decodeSum=0;submitSum=0;}
+}catch(error){fail(error);}finally{frame.close();}}
+async function start(streams,options){try{
+if(typeof VideoDecoder==="undefined"){throw new Error("This Chrome exposes WebCodecs on the page but not in a worker");}
+canvas=options.canvas;context=canvas.getContext("2d",{alpha:false,desynchronized:true});if(!context){throw new Error("Canvas renderer is unavailable");}
+decoder=new VideoDecoder({output:output,error:fail});reader=streams.readable.getReader();periodStart=performance.now();
+while(!failed){var item=await reader.read();if(item.done){break;}var encoded=item.value,started=performance.now(),data=new Uint8Array(encoded.data),key=encoded.type==="key";
+if(workerPhase==="waiting for encoded frames"){workerPhase="waiting for a keyframe";postMessage({type:"phase",phase:workerPhase});}
+if(decoder.decodeQueueSize>6){decoder.reset();configuredCodec=null;needKey=true;arrivals.clear();}
+if(needKey&&!key){skipped++;continue;}
+if(key){var codec=codecFromAnnexB(data);if(!codec){throw new Error("The H.264 keyframe lacks Annex-B SPS headers");}
+if(codec!==configuredCodec){var config={codec:codec,hardwareAcceleration:"prefer-hardware",optimizeForLatency:true},metadata=typeof encoded.getMetadata==="function"?encoded.getMetadata():{},codedWidth=metadata.width||options.width,codedHeight=metadata.height||options.height;if(codedWidth&&codedHeight){config.codedWidth=codedWidth;config.codedHeight=codedHeight;}var support=await VideoDecoder.isConfigSupported(config);
+if(!support.supported){config.hardwareAcceleration="no-preference";support=await VideoDecoder.isConfigSupported(config);}
+if(!support.supported){throw new Error("This controller cannot decode "+codec);}
+decoder.configure(support.config);configuredCodec=codec;acceleration=config.hardwareAcceleration;}
+workerPhase="waiting for decoded frames";postMessage({type:"phase",phase:workerPhase});
+needKey=false;}
+var rtp=encoded.timestamp>>>0;if(lastRtp!==null){var delta=(rtp-lastRtp)>>>0;if(delta>=2147483648){skipped++;continue;}chunkTime+=Math.max(1,Math.round(delta*1000000/90000));}lastRtp=rtp;
+arrivals.set(chunkTime,started);decoder.decode(new EncodedVideoChunk({type:key?"key":"delta",timestamp:chunkTime,data:data}));peakQueue=Math.max(peakQueue,decoder.decodeQueueSize);
+// Discard the encoded frame here: decoding it again through <video> would
+// duplicate work and restore the playback queue this renderer bypasses.
+}
+}catch(error){fail(error);}}
+self.onmessage=function(event){if(event.data.type==="start"){start(event.data,event.data);}};
+self.onrtctransform=function(event){start(event.transformer,event.transformer.options);};
+}
+function startFastPlayback(connection,receiver){try{
+fastCanvas=document.createElement("canvas");fastCanvas.id="fastCanvas";fastCanvas.classList.add("hidden");ui.stage.appendChild(fastCanvas);
+var canvas=fastCanvas.transferControlToOffscreen(),url=URL.createObjectURL(new Blob(["("+fastPlaybackWorker.toString()+")();"],{type:"application/javascript"}));
+try{fastWorker=new Worker(url);}finally{URL.revokeObjectURL(url);}
+fastWorker.onerror=function(event){failFastPlayback(connection,event.message||"Worker failed");};
+fastWorker.onmessage=function(event){if(connection!==pc){return;}var msg=event.data;if(msg.type==="phase"){fastPhase=msg.phase;return;}if(msg.type==="error"){failFastPlayback(connection,msg.error);return;}if(msg.type==="ready"||msg.type==="stats"){fastActive=true;fastMetrics=Object.assign(fastMetrics||{},msg);fastCanvas.classList.remove("hidden");ui.video.style.opacity="0";updatePictureSize();if(msg.type==="stats"){smooth("decode",msg.decode);smooth("fastSubmit",msg.submit);renderFps=msg.fps;callbackFps=msg.fps;metrics.width=msg.width;metrics.height=msg.height;}updateDebug();}};
+if(typeof RTCRtpScriptTransform!=="undefined"){receiver.transform=new RTCRtpScriptTransform(fastWorker,{canvas:canvas,width:lastRequestedScreen.width,height:lastRequestedScreen.height},[canvas]);}else{var streams=receiver.createEncodedStreams();fastWorker.postMessage({type:"start",canvas:canvas,width:lastRequestedScreen.width,height:lastRequestedScreen.height,readable:streams.readable,writable:streams.writable},[canvas,streams.readable,streams.writable]);}
+return true;
+}catch(error){failFastPlayback(connection,error.message);return false;}}
+function put(id,value){if(ui[id].textContent!==String(value)){ui[id].textContent=value;}}
+function ms(value,digits){return Number.isFinite(value)?value.toFixed(digits===undefined?0:digits)+" ms":"--";}
+function smooth(key,value){if(!Number.isFinite(value)||value<0||value>30000){return;}metrics[key]=metrics[key]===undefined?value:0.65*metrics[key]+0.35*value;}
+function normalizeHost(value){value=(value||"").trim().replace(/\/+$/ ,"");if(!/^https?:\/\//i.test(value)){value="https://"+value;}return value;}
+function save(host,secret){try{localStorage.setItem("dkWebrtcHost",host);localStorage.setItem("dkWebrtcSecret",secret);localStorage.setItem("dkStreamModeV2",ui.network.value==="adaptive"?"adaptive":"stable");}catch(e){}}
+function load(){try{ui.host.value=location.protocol==="https:"||location.protocol==="http:"?location.origin:(localStorage.getItem("dkWebrtcHost")||"");ui.secret.value=localStorage.getItem("dkWebrtcSecret")||"";ui.network.value=localStorage.getItem("dkStreamModeV2")==="adaptive"?"adaptive":"stable";swapEscapeGrave=localStorage.getItem("dkHtmlEscapeGrave")!=="off";followWindowsMouse=localStorage.getItem("dkFollowWindowsMouse")!=="off";var savedScroll=parseFloat(localStorage.getItem("dkScrollSpeed"));if(Number.isFinite(savedScroll)){scrollSpeed=Math.max(0.25,Math.min(2,savedScroll));}}catch(e){if(location.protocol==="https:"||location.protocol==="http:"){ui.host.value=location.origin;}}if(!ui.secret.value){ui.advanced.open=true;}}
+function updateKeyboardSwap(){ui.keyboardSwap.textContent="HTML Esc ↔ ~ swap: "+(swapEscapeGrave?"on":"off");}
+function keyboardRole(e){if(e.code==="Escape"){return "escape";}if(e.code==="Backquote"){return "grave";}if(e.key==="Escape"){return "escape";}if(e.key==="`"||e.key==="~"){return "grave";}return null;}
+function remoteEscape(e){return keyboardRole(e)==="escape";}
+function remoteGrave(e){return keyboardRole(e)==="grave";}
+function notifyInput(message){ui.notice.textContent=message;ui.notice.classList.toggle("hidden",!message);if(noticeTimer){clearTimeout(noticeTimer);}if(message){noticeTimer=setTimeout(function(){ui.notice.classList.add("hidden");noticeTimer=null;},5000);}}
+function updateMouseUi(){var locked=document.pointerLockElement===ui.video;ui.gameMouse.textContent=locked?"Mouse: locked":gameMouse?"Click to lock":"Mouse: off";ui.gameMouse.setAttribute("aria-pressed",locked?"true":"false");ui.autoMouse.textContent="Follow Windows mouse: "+(followWindowsMouse?"on":"off");}
+function syncHostMouse(state){if(!state||typeof state.locked!=="boolean"){return;}var previousLock=hostMouseLocked,changed=previousLock!==state.locked;hostMouseLocked=state.locked;if(!followWindowsMouse){return;}if(!state.locked){autoMouseSuppressed=false;if(previousLock===true&&changed&&gameMouse){exitGameMouse(true);}return;}if(changed&&!autoMouseSuppressed&&!gameMouse){gameMouse=true;updateMouseUi();lockMouse();}}
+function tuneReceiver(receiver){if(!receiver){return;}var target=receiver.track&&receiver.track.kind==="audio"?60:30,applied=[];try{if("jitterBufferTarget" in receiver){receiver.jitterBufferTarget=target;applied.push("target "+target+" ms");}}catch(e){}try{if("playoutDelayHint" in receiver){receiver.playoutDelayHint=target/1000;applied.push("legacy "+target+" ms");}}catch(e){}if(receiver.track&&receiver.track.kind==="video"){receiverHint=applied.length?applied.join(" + "):"unsupported";}}
+function bitrateBits(value){var match=/^\s*(\d+(?:\.\d+)?)\s*([kKmMgG]?)\s*$/.exec(String(value));return match?Number(match[1])*({"":1,k:1000,m:1000000,g:1000000000}[match[2].toLowerCase()]):NaN;}
+function audioHint(message){ui.audioHint.textContent=message||"";ui.audioHint.classList.toggle("hidden",!message);}
+function updateAudioHint(){var capture=hostInfo&&hostInfo.audio,message=audioPlaybackError;if(capture==="unavailable"){message="PC audio needs SoundCard and NumPy installed in the host's Python environment.";}else if(capture&&capture!=="starting"&&capture!=="streaming"&&capture!=="off on host"){message="PC audio: "+capture;}audioHint(message);}
+function soundUi(){ui.audio.muted=audioContext?true:!soundEnabled;if(audioGain){audioGain.gain.value=soundEnabled?1:0;}ui.sound.textContent="Sound: "+(soundEnabled?"on":"off");}
+function prepareAudio(){var AudioContextClass=window.AudioContext||window.webkitAudioContext;if(!AudioContextClass){return Promise.resolve(false);}try{if(!audioContext){audioContext=new AudioContextClass({latencyHint:"interactive"});audioGain=audioContext.createGain();audioGain.connect(audioContext.destination);soundUi();}var resumed=audioContext.state==="running"?Promise.resolve():audioContext.resume();return Promise.resolve(resumed).then(function(){if(audioContext.state!=="running"){throw new Error("Audio playback is suspended");}audioPlaybackError="";updateAudioHint();return true;}).catch(function(){audioPlaybackError="Click Sound: on or the video to enable Chromebook audio.";updateAudioHint();return false;});}catch(error){audioPlaybackError="Audio playback: "+error.message;updateAudioHint();return Promise.resolve(false);}}
+function playRemoteAudio(track){audioReceived=true;ui.audio.srcObject=new MediaStream([track]);if(audioContext){try{if(audioSource){audioSource.disconnect();}audioSource=audioContext.createMediaStreamSource(ui.audio.srcObject);audioSource.connect(audioGain);ui.audio.pause();soundUi();prepareAudio();return;}catch(error){audioPlaybackError="Audio playback: "+error.message;updateAudioHint();return;}}soundUi();var play=ui.audio.play();if(play&&play.then){play.then(function(){audioPlaybackError="";updateAudioHint();}).catch(function(){audioPlaybackError="Click Sound: on to allow Chromebook audio playback.";updateAudioHint();});}}
+function stopRemoteAudio(){if(audioSource){audioSource.disconnect();audioSource=null;}audioReceived=false;audioPlaybackError="";ui.audio.pause();ui.audio.srcObject=null;audioHint("");}
+function connectedUi(on){ui.setup.classList.toggle("hidden",on);ui.quickControls.classList.toggle("hidden",!on||menuSuppressed);ui.controls.classList.add("hidden");if(on){ui.stage.focus();}else{ui.debug.classList.add("hidden");}}
+function waitForIceGatheringComplete(connection){if(connection.iceGatheringState==="complete"){return Promise.resolve();}return new Promise(function(resolve){var done=false;function finish(){if(done){return;}done=true;connection.removeEventListener("icegatheringstatechange",check);resolve();}function check(){if(connection.iceGatheringState==="complete"){finish();}}connection.addEventListener("icegatheringstatechange",check);setTimeout(finish,5000);});}
+function sendOn(channel,obj){if(channel&&channel.readyState==="open"){try{channel.send(JSON.stringify(obj));}catch(e){}}}
+function mappedKey(obj){var mapped=Object.assign({},obj);if(obj.type==="escape"){mapped.key="Escape";mapped.code="Escape";}if(swapEscapeGrave){if(mapped.code==="Escape"||mapped.key==="Escape"){mapped.key="`";mapped.code="Backquote";}else if(mapped.code==="Backquote"||mapped.key==="`"||mapped.key==="~"){mapped.key="Escape";mapped.code="Escape";}}return mapped;}
+function sendControl(obj){sendOn(control,obj.type==="key"||obj.type==="escape"?mappedKey(obj):obj);}function sendPointer(obj){if(pointer&&pointer.bufferedAmount<16384){sendOn(pointer,obj);}}
+function startPing(){stopPing();lastPongAt=Date.now();pingTimer=setInterval(function(){if(!control||control.readyState!=="open"||document.hidden){return;}if(Date.now()-lastPongAt>10000){scheduleReconnect("Windows host stopped responding.");return;}var id=++pingId,now=performance.now();pendingPings[id]=now;Object.keys(pendingPings).forEach(function(k){if(now-pendingPings[k]>5000){delete pendingPings[k];}});sendControl({type:"ping",id:id});},350);}
+function stopPing(){if(pingTimer){clearInterval(pingTimer);pingTimer=null;}pendingPings={};controlRtt=null;}
+function requestFrames(){if(!videoReady()||!ui.video.requestVideoFrameCallback){return;}frameCallback=ui.video.requestVideoFrameCallback(function(now,meta){if(!frameStart){frameStart=now;renderFrameBase=Number.isFinite(meta.presentedFrames)?meta.presentedFrames:null;frameCount=0;}frameCount++;if(now-frameStart>=1000){callbackFps=frameCount*1000/(now-frameStart);renderFps=renderFrameBase!==null&&Number.isFinite(meta.presentedFrames)?(meta.presentedFrames-renderFrameBase)*1000/(now-frameStart):callbackFps;frameStart=now;renderFrameBase=Number.isFinite(meta.presentedFrames)?meta.presentedFrames:null;frameCount=0;}
+if(Number.isFinite(meta.captureTime)&&Number.isFinite(meta.expectedDisplayTime)){smooth("total",meta.expectedDisplayTime-meta.captureTime);}
+if(Number.isFinite(meta.captureTime)&&Number.isFinite(meta.receiveTime)){smooth("ingress",meta.receiveTime-meta.captureTime);}
+if(Number.isFinite(meta.receiveTime)&&Number.isFinite(meta.expectedDisplayTime)){smooth("local",meta.expectedDisplayTime-meta.receiveTime);}
+if(Number.isFinite(meta.processingDuration)){smooth("processing",meta.processingDuration*1000);}
+requestFrames();});}
+function videoReady(){return !!ui.video.srcObject;}
+function controllerScreen(){var ratio=window.devicePixelRatio||1,screen=window.screen||{},width=Math.round((screen.width||window.innerWidth)*ratio),height=Math.round((screen.height||window.innerHeight)*ratio);return {width:Math.max(320,Math.min(8192,width)),height:Math.max(200,Math.min(4320,height))};}
+function updatePictureSize(){var dimensions=pictureDimensions(),surfaces=fastCanvas?[ui.video,fastCanvas]:[ui.video];surfaces.forEach(function(surface){surface.classList.toggle("nativePixels",nativePixels);if(nativePixels){var ratio=window.devicePixelRatio||1;surface.style.width=(dimensions.width/ratio)+"px";surface.style.height=(dimensions.height/ratio)+"px";}else{surface.style.width="";surface.style.height="";}});ui.pictureSize.textContent=nativePixels?"Picture: native pixels":"Picture: fit screen";}
+ui.pictureSize.addEventListener("click",function(){nativePixels=!nativePixels;updatePictureSize();});
+ui.video.addEventListener("loadedmetadata",updatePictureSize);
+window.addEventListener("resize",function(){updatePictureSize();if(lastRequestedScreen&&pc&&pc.connectionState==="connected"){var size=controllerScreen();if(size.width!==lastRequestedScreen.width||size.height!==lastRequestedScreen.height){scheduleReconnect("Controller screen changed.");}}});
+function startStats(){stopStats();lastStatsAt=Date.now();lastVideoProgressAt=Date.now();statTimer=setInterval(function(){
+if(!pc){return;}var connection=pc,wallNow=Date.now();if(statsInFlight){if(wallNow-lastStatsAt>8000&&!document.hidden){scheduleReconnect("Receiver statistics stopped responding.");}return;}if(wallNow-lastStatsAt>12000&&!document.hidden){scheduleReconnect("Controller resumed after sleep.");return;}lastStatsAt=wallNow;statsInFlight=true;
+connection.getStats().then(function(reports){if(connection!==pc){return;}var inbound=null,audioInbound=null,pair=null,transport=null;
+reports.forEach(function(report){if(report.type==="inbound-rtp"&&(report.kind==="video"||report.mediaType==="video")){inbound=report;}if(report.type==="inbound-rtp"&&(report.kind==="audio"||report.mediaType==="audio")){audioInbound=report;}if(report.type==="candidate-pair"&&report.state==="succeeded"&&(report.selected||report.nominated)){pair=report;}if(report.type==="transport"&&report.selectedCandidatePairId){transport=report;}});
+if(transport){pair=reports.get(transport.selectedCandidatePairId)||pair;}if(pair){if(Number.isFinite(pair.currentRoundTripTime)){smooth("iceRtt",pair.currentRoundTripTime*1000);}var local=reports.get(pair.localCandidateId),remote=reports.get(pair.remoteCandidateId);metrics.path=(local?local.candidateType:"?")+" \u2192 "+(remote?remote.candidateType:"?")+" / "+(local?local.protocol:"?");}
+if(inbound){var now=inbound.timestamp,bytes=inbound.bytesReceived||0,decoded=inbound.framesDecoded||0,received=inbound.framesReceived,emitted=inbound.jitterBufferEmittedCount||0,packets=inbound.packetsReceived||0,lost=inbound.packetsLost||0;
+if(previous&&previous.ssrc===inbound.ssrc&&now>previous.time){var seconds=(now-previous.time)/1000;if(seconds>0){smooth("bitrate",(bytes-previous.bytes)*8/seconds/1000000);if(Number.isFinite(received)&&Number.isFinite(previous.received)&&received>=previous.received){smooth("receivedFps",(received-previous.received)/seconds);}if(decoded>=previous.decoded){smooth("decodedFps",(decoded-previous.decoded)/seconds);}if(decoded>previous.decoded){lastVideoProgressAt=Date.now();if(Number.isFinite(inbound.totalDecodeTime)){smooth("decode",(inbound.totalDecodeTime-previous.decode)/(decoded-previous.decoded)*1000);}}if(emitted>previous.emitted&&Number.isFinite(inbound.jitterBufferDelay)){smooth("buffer",(inbound.jitterBufferDelay-previous.buffer)/(emitted-previous.emitted)*1000);if(Number.isFinite(inbound.jitterBufferTargetDelay)&&Number.isFinite(previous.target)){smooth("bufferTarget",(inbound.jitterBufferTargetDelay-previous.target)/(emitted-previous.emitted)*1000);}if(Number.isFinite(inbound.jitterBufferMinimumDelay)&&Number.isFinite(previous.minimum)){smooth("bufferMinimum",(inbound.jitterBufferMinimumDelay-previous.minimum)/(emitted-previous.emitted)*1000);}}
+var lostDelta=Math.max(0,lost-previous.lost),packetDelta=Math.max(0,packets-previous.packets);sendControl({type:"network_stats",lossFraction:lostDelta/Math.max(1,lostDelta+packetDelta),rttMs:pair&&Number.isFinite(pair.currentRoundTripTime)?pair.currentRoundTripTime*1000:null});
+}}else if(!previous||previous.ssrc!==inbound.ssrc){lastVideoProgressAt=Date.now();}
+previous={ssrc:inbound.ssrc,time:now,bytes:bytes,received:received,decoded:decoded,packets:packets,lost:lost,decode:inbound.totalDecodeTime||0,buffer:inbound.jitterBufferDelay||0,emitted:emitted,target:inbound.jitterBufferTargetDelay,minimum:inbound.jitterBufferMinimumDelay};
+metrics.jitter=Number.isFinite(inbound.jitter)?inbound.jitter*1000:null;metrics.fps=Number.isFinite(inbound.framesPerSecond)?inbound.framesPerSecond:metrics.decodedFps;metrics.width=fastActive?fastMetrics.width:inbound.frameWidth||ui.video.videoWidth;metrics.height=fastActive?fastMetrics.height:inbound.frameHeight||ui.video.videoHeight;metrics.dropped=inbound.framesDropped;metrics.loss=inbound.packetsLost;
+var codec=reports.get(inbound.codecId);metrics.codec=codec?codec.mimeType.replace("video/",""):"H.264";metrics.decoder=(inbound.decoderImplementation||"browser")+(inbound.powerEfficientDecoder===true?" / efficient":inbound.powerEfficientDecoder===false?" / software or inefficient":"");
+if(!fastActive&&!document.hidden&&connection.connectionState==="connected"&&Date.now()-lastVideoProgressAt>8000){scheduleReconnect("Video stopped progressing.");return;}
+}
+if(audioInbound){var ae=audioInbound.jitterBufferEmittedCount||0,ad=audioInbound.jitterBufferDelay;if(previousAudio&&audioInbound.timestamp>previousAudio.time){var audioSeconds=(audioInbound.timestamp-previousAudio.time)/1000;smooth("audioBitrate",((audioInbound.bytesReceived||0)-previousAudio.bytes)*8/audioSeconds/1000);if(ae>previousAudio.emitted&&Number.isFinite(ad)){smooth("audioBuffer",(ad-previousAudio.delay)/(ae-previousAudio.emitted)*1000);}}previousAudio={time:audioInbound.timestamp,bytes:audioInbound.bytesReceived||0,emitted:ae,delay:ad};}
+updateDebug();}).catch(function(){}).then(function(){if(connection===pc){statsInFlight=false;}});
+},1000);}
+function stopStats(){if(statTimer){clearInterval(statTimer);statTimer=null;}previous=null;previousAudio=null;statsInFlight=false;}
+function updateDebug(force){if(ui.debug.classList.contains("hidden")){return;}var debugNow=performance.now();if(!force&&debugNow-lastDebugUpdate<1000){return;}lastDebugUpdate=debugNow;var rtt=metrics.iceRtt===undefined?controlRtt:metrics.iceRtt;
+put("dBuild",CLIENT_BUILD+" / "+(hostInfo?(hostInfo.hostBuild||"older host"):"waiting"));
+put("dMode",lastRequestedScreen&&hostInfo?lastRequestedScreen.width+" × "+lastRequestedScreen.height+" → "+hostInfo.targetWidth+" × "+hostInfo.targetHeight:"--");
+put("dModeNote",hostInfo?(hostInfo.resolutionNote||(lastRequestedScreen&&hostInfo.targetWidth===lastRequestedScreen.width&&hostInfo.targetHeight===lastRequestedScreen.height?"Matched controller screen":"Resolution differs; check Python build and virtual display modes")):"waiting for host");
+put("dController",lastRequestedScreen?lastRequestedScreen.width+" × "+lastRequestedScreen.height:"--");
+put("dCapture",hostInfo?(hostInfo.displayName||"DXGI output")+" / output "+hostInfo.displayOutputIndex:"waiting for host");
+put("dEncoder",hostInfo?(hostInfo.captureMode==="direct"?"GPU direct → NVENC":"CPU scale → NVENC")+" / "+hostInfo.fps+" target FPS / GOP "+hostInfo.gop+(hostInfo.videoPipe?" / "+hostInfo.videoPipe:""):"--");
+var vbv=hostInfo?bitrateBits(hostInfo.vbvBuffer):NaN,ceiling=hostInfo?bitrateBits(hostInfo.rateMode==="cbr"?hostInfo.bitrate:hostInfo.maxrate):NaN;
+put("dVbv",Number.isFinite(vbv)&&ceiling>0?ms(vbv/ceiling*1000,1)+" at peak bitrate":"--");
+put("dPlayback",fastActive?"WebCodecs / "+fastMetrics.acceleration+" / "+(fastMetrics.queue||0)+" queued (peak "+(fastMetrics.peakQueue||0)+")":pc&&pc.dkFastPlayback?"Fast renderer starting":"Standard HTML video"+(fastBlocked?" / fast unavailable: "+fastFailureReason:""));
+put("dLocalLabel",fastActive?"Complete frame → canvas submit":"Receive → display");
+put("dIngress",ms(metrics.ingress));put("dRtt",ms(rtt));put("dOneWay",Number.isFinite(rtt)?"≈ "+ms(rtt/2):"--");
+put("dJitter",ms(metrics.jitter,1));put("dBuffer",ms(metrics.buffer,1));put("dDecode",ms(metrics.decode,1));put("dLocal",ms(fastActive?metrics.fastSubmit:metrics.local));
+put("dQueue",hostInfo&&hostInfo.queueFrames!==null&&hostInfo.queueFrames!==undefined?hostInfo.queueFrames+" packets / "+hostInfo.skippedPackets+" skipped":"--");
+put("dQueuePeak",hostInfo&&Number.isFinite(hostInfo.peakQueueFrames)?hostInfo.peakQueueFrames+" packets / above "+hostInfo.queueRecoveryFrames:"--");
+put("dBufferTarget",ms(metrics.bufferTarget,1)+" / "+ms(metrics.bufferMinimum,1));put("dBufferHint",receiverHint+" / "+(hostInfo&&Number.isFinite(hostInfo.playoutMaxMs)?"0–"+hostInfo.playoutMaxMs+" ms":"unavailable"));put("dAudioBuffer",ms(metrics.audioBuffer,1));put("dInput",hostInfo?(hostInfo.inputAdmin?"Administrator":"Standard user; elevated apps can block"):"--");put("dHostMouse",hostMouseLocked===null?"Unknown":hostMouseLocked?"Captured":"Free");put("dCallbacks",callbackFps===null?"--":callbackFps.toFixed(1));
+put("dTotal",Number.isFinite(metrics.total)?"≈ "+ms(metrics.total):"Unavailable");
+put("dSentFps",(hostInfo&&Number.isFinite(hostInfo.hostPacketRate)?hostInfo.hostPacketRate.toFixed(1):"--")+" / "+(Number.isFinite(metrics.receivedFps)?metrics.receivedFps.toFixed(1):"--"));
+put("dFps",(fastActive&&Number.isFinite(fastMetrics.fps)?fastMetrics.fps.toFixed(1):Number.isFinite(metrics.fps)?metrics.fps.toFixed(1):"--")+" / "+(renderFps===null?"--":renderFps.toFixed(1)));
+put("dResolution",metrics.width&&metrics.height?metrics.width+" × "+metrics.height:"--");
+put("dBitrate",Number.isFinite(metrics.bitrate)?metrics.bitrate.toFixed(1)+" Mbps":"--");
+put("dAudio",hostInfo?(hostInfo.audioDevice&&hostInfo.audio==="streaming"?hostInfo.audioDevice+(Number.isFinite(hostInfo.audioLevel)?" / "+(hostInfo.audioLevel>0?Math.max(-99,20*Math.log10(hostInfo.audioLevel)).toFixed(0)+" dBFS":"silent"):""):hostInfo.audio):"--");put("dRate",hostInfo?((hostInfo.streamMode==="adaptive"?"Adaptive":"Stable")+" / "+((bitrateBits(hostInfo.rateMode==="cbr"?hostInfo.bitrate:hostInfo.maxrate)||0)/1000000).toFixed(1)+" Mbps peak / "+(hostInfo.rateChanges||0)+" encoder restarts / "+(hostInfo.rateNote||"fixed")):"--");put("dAudioPlayback",(audioContext?audioContext.state:ui.audio.paused?"paused":"HTML audio")+(soundEnabled?" / on":" / muted")+" / "+(audioReceived?"track received":"waiting")+" / "+(Number.isFinite(metrics.audioBitrate)?metrics.audioBitrate.toFixed(0)+" kbps":"--"));
+put("dDropped",fastActive?(fastMetrics.skipped||0)+" fast skips (network lost "+(metrics.loss||0)+" packets)":metrics.dropped===undefined?"--":metrics.dropped+" (network lost "+(metrics.loss||0)+" packets)");
+put("dCodec",fastActive?"H264 / WebCodecs / "+(fastMetrics.acceleration||"starting"):metrics.codec?metrics.codec+" / "+metrics.decoder:"--");put("dPath",metrics.path||"--");
+put("dSetup",ms(signalingMs)+" / "+ms(iceMs));put("dState",pc?pc.connectionState:"disconnected");
+put("dNote",fastActive?"Fast timing starts when a complete encoded frame reaches the worker and ends at canvas submission. It excludes packet assembly, capture/encode, network and actual screen presentation. Hardware preference is a hint, not proof of hardware decoding. Compare responsiveness with standard playback; the two timing rows have different endpoints.":(Number.isFinite(metrics.total)?"Sender timeline → display uses the browser's RTP clock estimate; it does not measure capture/encode or upstream buffering.":"Browser did not expose captureTime; sender timeline → display is unavailable.")+" RTT/2 estimates one-way network delay. Buffer target is an estimate, not extra measured latency. Actual input-to-screen latency needs a separate measurement.");}
+function sendEscapePulse(){if(!control||control.readyState!=="open"||performance.now()-lastEscapePulse<250){return;}lastEscapePulse=performance.now();releaseKeys();releaseMouse();put("inputStatus","Releasing Windows game input…");sendControl({type:"escape"});}
+function releaseKeys(){Object.keys(pressedKeys).forEach(function(code){sendControl({type:"key",action:"up",key:pressedKeys[code],code:code});});pressedKeys={};}
+function releaseMouse(){Object.keys(pressedButtons).forEach(function(button){sendControl({type:"mouse",action:"up",button:Number(button)});});pressedButtons={};}
+function showRecoveryControls(){menuSuppressed=false;ui.quickControls.classList.remove("hidden");ui.controls.classList.remove("hidden");ui.stage.focus();}
+function exitGameMouse(fromHost){gameMouse=false;if(!fromHost){autoMouseSuppressed=true;}if(document.pointerLockElement===ui.video){deliberateUnlock=true;document.exitPointerLock();}updateMouseUi();}
+function postOffer(host,secret,connection,deviceScreen){var abort=typeof AbortController!=="undefined"?new AbortController():null,timer,started=performance.now(),options={method:"POST",mode:"cors",cache:"no-store",headers:{"Content-Type":"application/json","X-Remote-Secret":secret},body:JSON.stringify({sdp:connection.localDescription.sdp,type:connection.localDescription.type,screen:deviceScreen,clientBuild:CLIENT_BUILD,networkMode:"auto",streamMode:ui.network.value==="adaptive"?"adaptive":"stable",clientId:ui.clientToken.value})};if(abort){options.signal=abort.signal;}var timeout=new Promise(function(resolve,reject){timer=setTimeout(function(){if(abort){abort.abort();}reject(new Error("Signaling timed out"));},12000);});var request=fetch(host+"/offer",options).then(function(response){signalingMs=performance.now()-started;if(!response.ok){return response.text().then(function(t){throw new Error("Signaling HTTP "+response.status+": "+t);});}return response.json();});return Promise.race([request,timeout]).then(function(answer){clearTimeout(timer);return answer;},function(error){clearTimeout(timer);throw error;});}
+function cleanup(showSetup){var closingConnection=pc;pc=null;if(disconnectTimer){clearTimeout(disconnectTimer);disconnectTimer=null;}if(wakeTimer){clearTimeout(wakeTimer);wakeTimer=null;}stopPing();stopStats();stopFastPlayback();if(wheelTimer){clearTimeout(wheelTimer);wheelTimer=null;}wheelPending=null;releaseKeys();releaseMouse();put("inputStatus","");if(altTimer){clearTimeout(altTimer);altTimer=null;}altHeld=false;altSent=false;if(document.pointerLockElement){deliberateUnlock=true;document.exitPointerLock();}gameMouse=false;hostMouseLocked=null;autoMouseSuppressed=false;updateMouseUi();if(frameCallback&&ui.video.cancelVideoFrameCallback){ui.video.cancelVideoFrameCallback(frameCallback);frameCallback=0;}if(pointer){try{pointer.close();}catch(e){}pointer=null;}if(control){try{control.close();}catch(e){}control=null;}if(closingConnection){try{closingConnection.close();}catch(e){}}ui.video.srcObject=null;stopRemoteAudio();if(showSetup){connectedUi(false);ui.connect.disabled=false;}}
+function scheduleReconnect(reason){if(!wantConnection||reconnectTimer){return;}lastConnectionError=reason;retryAttempt++;var delay=retryDelay,relock=gameMouse;cleanup(true);if(relock){gameMouse=true;updateMouseUi();}put("status",reason+" Retrying in "+Math.ceil(delay/1000)+" seconds...");reconnectTimer=setTimeout(function(){reconnectTimer=null;if(wantConnection){connect(false);}},delay);retryDelay=Math.min(10000,retryDelay*1.5);}
+function connect(resetRetry){if(resetRetry){retryAttempt=0;lastConnectionError="";retryDelay=2000;}prepareAudio();var host=normalizeHost(ui.host.value),secret=(ui.secret.value||"").trim();if(!host||!secret){put("status","Enter host and secret.");return;}var deviceScreen=controllerScreen();lastRequestedScreen=deviceScreen;var relock=gameMouse;cleanup(false);if(relock){gameMouse=true;updateMouseUi();}hostInfo=null;metrics={};renderFps=null;callbackFps=null;renderFrameBase=null;frameCount=0;frameStart=0;signalingMs=null;iceMs=null;connectStart=performance.now();save(host,secret);ui.connect.disabled=true;put("status",lastConnectionError?"Retry "+retryAttempt+": "+lastConnectionError:"Creating WebRTC peer...");
+wantConnection=true;var useFast=fastPreferred&&!fastBlocked&&fastSupported();pc=new RTCPeerConnection({iceServers:[{urls:"stun:stun.cloudflare.com:3478"}],bundlePolicy:"max-bundle",encodedInsertableStreams:useFast&&typeof RTCRtpScriptTransform==="undefined"});var connection=pc;connection.dkFastPlayback=useFast;connection.addTransceiver("video",{direction:"recvonly"});connection.addTransceiver("audio",{direction:"recvonly"});
+control=pc.createDataChannel("control",{ordered:true});pointer=pc.createDataChannel("pointer",{ordered:false,maxRetransmits:0});
+control.onclose=function(){if(connection===pc&&wantConnection){scheduleReconnect("Control connection closed.");}};control.onopen=function(){if(connection!==pc){return;}startPing();startStats();updateDebug();};
+control.onmessage=function(event){if(connection!==pc){return;}var msg;try{msg=JSON.parse(event.data);}catch(e){return;}if(msg.type==="capture_restart"){scheduleReconnect("Display layout changed.");return;}if(msg.type==="escape_ack"){put("inputStatus","Escape sent to Windows.");return;}if(msg.type==="escape_error"||msg.type==="input_error"){put("inputStatus","Windows input error: "+msg.error);notifyInput(msg.error);return;}if(msg.type==="mouse_state"){syncHostMouse(msg);return;}if(msg.type==="host_info"){var oldNote=hostInfo&&hostInfo.resolutionNote;hostInfo=msg;if(msg.resolutionNote&&msg.resolutionNote!==oldNote){notifyInput(msg.resolutionNote);}syncHostMouse(msg.mouseState);updateAudioHint();updateDebug();}if(msg.type==="pong"){lastPongAt=Date.now();var started=pendingPings[msg.id];if(started!==undefined){delete pendingPings[msg.id];var rtt=performance.now()-started;controlRtt=controlRtt===null?rtt:controlRtt*0.7+rtt*0.3;updateDebug();}}};
+// Keep the received track attached to a media sink while fast playback starts.
+pc.ontrack=function(event){if(connection!==pc){return;}tuneReceiver(event.receiver);if(event.track.kind==="audio"){if(connection.dkFastPlayback&&typeof RTCRtpScriptTransform==="undefined"){try{var audioStreams=event.receiver.createEncodedStreams();audioStreams.readable.pipeTo(audioStreams.writable).catch(function(error){failFastPlayback(connection,error.message);});}catch(error){failFastPlayback(connection,error.message);return;}}playRemoteAudio(event.track);return;}if(event.track.kind!=="video"){return;}ui.video.srcObject=new MediaStream([event.track]);if(connection.dkFastPlayback&&!startFastPlayback(connection,event.receiver)){return;}var p=ui.video.play();if(p&&p.catch){p.catch(function(){});}if(!connection.dkFastPlayback){requestFrames();}};
+pc.onconnectionstatechange=function(){if(connection!==pc){return;}if(connection.connectionState==="connected"){retryDelay=2000;retryAttempt=0;lastConnectionError="";connection.getReceivers().forEach(tuneReceiver);connectedUi(true);put("status","");if(connection.dkFastPlayback){fastTimer=setTimeout(function(){fastTimer=null;if(connection===pc&&!fastActive){failFastPlayback(connection,fastPhase);}},5000);}}updateDebug();if(connection.connectionState==="failed"||connection.connectionState==="closed"){scheduleReconnect("WebRTC "+connection.connectionState+" (ICE "+connection.iceConnectionState+").");}};
+pc.oniceconnectionstatechange=function(){if(connection!==pc){return;}put("status","ICE: "+connection.iceConnectionState);if(connection.iceConnectionState==="disconnected"){scheduleDisconnectedRecovery(connection);}else if(disconnectTimer){clearTimeout(disconnectTimer);disconnectTimer=null;}if(connection.iceConnectionState==="failed"){scheduleReconnect("ICE failed; the WebRTC network path could not be established.");}};
+pc.createOffer().then(function(offer){if(connection!==pc){return;}return connection.setLocalDescription(offer);}).then(function(){if(connection!==pc){return;}var started=performance.now();put("status","Finding network path (ICE)...");return waitForIceGatheringComplete(connection).then(function(){iceMs=performance.now()-started;});}).then(function(){if(connection!==pc){return;}put("status","Sending WebRTC offer...");return postOffer(host,secret,connection,deviceScreen);}).then(function(answer){if(connection!==pc){return;}if(answer.hostBuild!==CLIENT_BUILD){notifyInput("HTML and Python builds differ. Restart the updated host and reopen this page.");}put("status","Applying WebRTC answer...");return connection.setRemoteDescription(answer);}).then(function(){if(connection===pc){put("status","Connecting peer-to-peer...");}}).catch(function(error){if(connection!==pc){return;}console.error(error);var detail=String(error&&error.message||error||"Unknown connection error").replace(/\s+/g," ").slice(0,220);if(!/Signaling HTTP [34]\d\d/.test(detail)){scheduleReconnect("Connection attempt failed: "+detail);}else{put("status","Connection error:\n"+detail);cleanup(true);ui.connect.disabled=false;wantConnection=false;}});}
+function scheduleDisconnectedRecovery(connection){if(disconnectTimer){clearTimeout(disconnectTimer);disconnectTimer=null;}if(!connection||connection!==pc||connection.iceConnectionState!=="disconnected"){return;}disconnectTimer=setTimeout(function(){disconnectTimer=null;if(connection!==pc||connection.iceConnectionState!=="disconnected"){return;}if(document.hidden){return;}scheduleReconnect("Network path did not recover.");},6000);}
+function resumeConnection(){if(!wantConnection||navigator.onLine===false){return;}if(reconnectTimer){return;}if(!pc){return;}var failed=pc.connectionState==="failed"||pc.connectionState==="closed"||pc.iceConnectionState==="failed"||(control&&control.readyState==="closed");if(failed){retryDelay=2000;scheduleReconnect("Connection failed while the controller was away.");return;}if(pc.iceConnectionState==="disconnected"){scheduleDisconnectedRecovery(pc);}}
+window.addEventListener("online",resumeConnection);
+window.addEventListener("pageshow",function(e){if(e.persisted){resumeConnection();}});
+document.addEventListener("resume",resumeConnection);
+document.addEventListener("visibilitychange",function(){if(document.hidden){return;}pendingPings={};lastPongAt=Date.now();lastStatsAt=Date.now();lastVideoProgressAt=Date.now();previous=null;previousAudio=null;statsInFlight=false;resumeConnection();});
+function pointerPosition(e){var rect=ui.video.getBoundingClientRect(),dimensions=pictureDimensions(),width=dimensions.width,height=dimensions.height,scale=Math.min(rect.width/width,rect.height/height),pictureWidth=width*scale,pictureHeight=height*scale,left=rect.left+(rect.width-pictureWidth)/2,top=rect.top+(rect.height-pictureHeight)/2,x=(e.clientX-left)/Math.max(1,pictureWidth),y=(e.clientY-top)/Math.max(1,pictureHeight);return{x:Math.max(0,Math.min(1,x)),y:Math.max(0,Math.min(1,y)),inside:x>=0&&x<=1&&y>=0&&y<=1};}
+function lockMouse(){if(!ui.video.requestPointerLock){gameMouse=false;updateMouseUi();notifyInput("This browser does not support mouse lock.");return;}function blocked(){updateMouseUi();notifyInput("Windows captured the mouse. Click the video or mouse-lock button to lock here.");}try{var result=ui.video.requestPointerLock();if(result&&result.catch){result.catch(blocked);}}catch(e){blocked();}}
+document.addEventListener("pointerlockchange",function(){var locked=document.pointerLockElement===ui.video;if(locked){pointerWasLocked=true;deliberateUnlock=false;gameMouse=true;notifyInput("");updateMouseUi();return;}if(pointerWasLocked){pointerWasLocked=false;if(!deliberateUnlock){sendEscapePulse();autoMouseSuppressed=true;}releaseKeys();releaseMouse();gameMouse=false;}deliberateUnlock=false;updateMouseUi();});
+document.addEventListener("pointerlockerror",function(){updateMouseUi();notifyInput("Click the video to lock the mouse; allow the browser permission if prompted.");});
+ui.gameMouse.addEventListener("click",function(){if(gameMouse&&document.pointerLockElement===ui.video){sendEscapePulse();exitGameMouse();}else{gameMouse=true;autoMouseSuppressed=false;updateMouseUi();lockMouse();}});
+ui.autoMouse.addEventListener("click",function(){followWindowsMouse=!followWindowsMouse;autoMouseSuppressed=false;try{localStorage.setItem("dkFollowWindowsMouse",followWindowsMouse?"on":"off");}catch(e){}updateMouseUi();if(followWindowsMouse&&hostMouseLocked){gameMouse=true;lockMouse();}});
+ui.keyboardSwap.addEventListener("click",function(){releaseKeys();swapEscapeGrave=!swapEscapeGrave;try{localStorage.setItem("dkHtmlEscapeGrave",swapEscapeGrave?"on":"off");}catch(e){}updateKeyboardSwap();});
+function updateScrollUi(){ui.scrollSpeed.value=Math.round(scrollSpeed*100);ui.scrollLabel.textContent=Math.round(scrollSpeed*100)+"%";}
+ui.scrollSpeed.addEventListener("input",function(){scrollSpeed=Math.max(0.25,Math.min(2,Number(ui.scrollSpeed.value)/100));updateScrollUi();try{localStorage.setItem("dkScrollSpeed",String(scrollSpeed));}catch(e){}});
+ui.releaseInput.addEventListener("click",function(){lastEscapePulse=-Infinity;sendEscapePulse();if(document.pointerLockElement===ui.video){exitGameMouse();}showRecoveryControls();});
+ui.sound.addEventListener("click",function(){var blocked=!!audioPlaybackError||!!(audioContext&&audioContext.state!=="running");if(!blocked){soundEnabled=!soundEnabled;}else{soundEnabled=true;}soundUi();prepareAudio().then(function(ready){if(soundEnabled&&ui.audio.srcObject&&!audioSource){if(ready&&audioContext){playRemoteAudio(ui.audio.srcObject.getAudioTracks()[0]);}else{var play=ui.audio.play();if(play&&play.then){play.then(function(){audioPlaybackError="";updateAudioHint();}).catch(function(){audioPlaybackError="Chromebook blocked audio. Click Sound again or allow sound for this tab.";updateAudioHint();});}}}});});
+ui.menu.addEventListener("click",function(){ui.controls.classList.toggle("hidden");});
+ui.diagnostics.addEventListener("click",function(){ui.debug.classList.toggle("hidden");updateDebug(true);});
+ui.video.addEventListener("mousemove",function(e){if(document.pointerLockElement===ui.video){if(e.movementX||e.movementY){sendPointer({type:"mouse",action:"relative",dx:e.movementX,dy:e.movementY});}return;}if(gameMouse){return;}var p=pointerPosition(e);if(p.inside){sendPointer({type:"mouse",action:"move",x:p.x,y:p.y});}});
+ui.video.addEventListener("mousedown",function(e){if(audioPlaybackError){prepareAudio();}e.preventDefault();ui.stage.focus();if(gameMouse){if(document.pointerLockElement!==ui.video){lockMouse();return;}}else{var p=pointerPosition(e);if(!p.inside){return;}sendPointer({type:"mouse",action:"move",x:p.x,y:p.y});}pressedButtons[e.button]=true;sendControl({type:"mouse",action:"down",button:e.button});});
+window.addEventListener("mouseup",function(e){delete pressedButtons[e.button];sendControl({type:"mouse",action:"up",button:e.button});});
+function wheelPixels(e){var mode=e.deltaMode||0,rect=ui.video.getBoundingClientRect(),dimensions=pictureDimensions(),width=dimensions.width,height=dimensions.height,scale=Math.min(rect.width/width,rect.height/height)||1;var dx=Number(e.deltaX)||0,dy=Number(e.deltaY)||0;if(mode===1){dx*=16;dy*=16;}else if(mode===2){dx*=width*scale;dy*=height*scale;}return {dx:dx/scale*scrollSpeed,dy:dy/scale*scrollSpeed};}
+function flushWheel(){wheelTimer=null;var pending=wheelPending;wheelPending=null;if(pending&&(pending.dx||pending.dy)){sendControl(pending);}}
+ui.video.addEventListener("wheel",function(e){e.preventDefault();if(!control||control.readyState!=="open"){return;}var delta=wheelPixels(e),p=null;if(document.pointerLockElement!==ui.video){p=pointerPosition(e);if(!p.inside){return;}}if(!wheelPending){wheelPending={type:"mouse",action:"scroll",dx:0,dy:0,linePixels:16};}wheelPending.dx+=delta.dx;wheelPending.dy+=delta.dy;if(p){wheelPending.x=p.x;wheelPending.y=p.y;}if(!wheelTimer){wheelTimer=setTimeout(flushWheel,4);}},{passive:false});
+ui.video.addEventListener("contextmenu",function(e){e.preventDefault();});
+function altDown(e){if(altHeld){e.preventDefault();return;}altHeld=true;altSent=false;altTimer=setTimeout(function(){altTimer=null;if(altHeld&&!altSent){menuSuppressed=!menuSuppressed;ui.quickControls.classList.toggle("hidden",menuSuppressed);if(menuSuppressed){ui.controls.classList.add("hidden");}}},1000);e.preventDefault();}
+window.addEventListener("keydown",function(e){if(e.key==="Alt"||e.code==="AltLeft"||e.code==="AltRight"){if(control&&control.readyState==="open"){altDown(e);}return;}if(!control||control.readyState!=="open"){return;}if(remoteEscape(e)){e.preventDefault();if(!e.repeat){escapeDownSeen=true;if(e.ctrlKey||e.altKey||e.shiftKey||e.metaKey){if(altHeld&&!altSent){altSent=true;if(altTimer){clearTimeout(altTimer);altTimer=null;}sendControl({type:"key",action:"down",key:"Alt",code:"AltLeft"});pressedKeys.AltLeft="Alt";}sendControl({type:"key",action:"down",key:"Escape",code:"Escape"});pressedKeys.Escape="Escape";}else{sendEscapePulse();if(gameMouse||document.pointerLockElement===ui.video){exitGameMouse();}}}return;}if(remoteGrave(e)){e.preventDefault();if(!e.repeat){var grave=e.shiftKey?"~":"`";sendControl({type:"key",action:"down",key:grave,code:"Backquote"});pressedKeys.Backquote=grave;}return;}if(altHeld&&!altSent){altSent=true;if(altTimer){clearTimeout(altTimer);altTimer=null;}sendControl({type:"key",action:"down",key:"Alt",code:"AltLeft"});pressedKeys.AltLeft="Alt";}if(e.key==="Tab"||e.key==="Backspace"||e.key===" "||e.key.indexOf("Arrow")===0||e.ctrlKey||e.altKey){e.preventDefault();}if(e.repeat){return;}sendControl({type:"key",action:"down",key:e.key,code:e.code});pressedKeys[e.code]=e.key;},true);
+window.addEventListener("keyup",function(e){if(e.key==="Alt"||e.code==="AltLeft"||e.code==="AltRight"){if(altTimer){clearTimeout(altTimer);altTimer=null;}if(altSent){sendControl({type:"key",action:"up",key:"Alt",code:"AltLeft"});delete pressedKeys.AltLeft;}altHeld=false;altSent=false;e.preventDefault();return;}if(!control||control.readyState!=="open"){return;}if(remoteEscape(e)){e.preventDefault();if(pressedKeys.Escape){sendControl({type:"key",action:"up",key:"Escape",code:"Escape"});delete pressedKeys.Escape;}else if(!escapeDownSeen){sendEscapePulse();}escapeDownSeen=false;return;}if(remoteGrave(e)){e.preventDefault();sendControl({type:"key",action:"up",key:pressedKeys.Backquote||"`",code:"Backquote"});delete pressedKeys.Backquote;return;}e.preventDefault();sendControl({type:"key",action:"up",key:e.key,code:e.code});delete pressedKeys[e.code];},true);
+window.addEventListener("blur",function(){if(altTimer){clearTimeout(altTimer);altTimer=null;}altHeld=false;altSent=false;escapeDownSeen=false;releaseKeys();releaseMouse();sendControl({type:"release_all"});});
+ui.disconnect.addEventListener("click",function(){wantConnection=false;if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}cleanup(true);put("status","Disconnected.");});ui.connect.addEventListener("click",function(){if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}connect(true);});
+function goFullscreen(){if(document.documentElement.requestFullscreen){document.documentElement.requestFullscreen().catch(function(){put("status","Fullscreen was blocked. Click Fullscreen again in the new tab.");});}}
+ui.fullscreen.addEventListener("click",goFullscreen);
+function syncKeyboardLock(){if(typeof navigator==="undefined"||!navigator.keyboard){return;}try{if(document.fullscreenElement&&navigator.keyboard.lock){var result=navigator.keyboard.lock(["Escape"]);if(result&&result.catch){result.catch(function(){put("inputStatus","Browser reserved Escape; releasing mouse lock still sends Escape to Windows.");});}}else if(navigator.keyboard.unlock){navigator.keyboard.unlock();}}catch(e){put("inputStatus","Browser reserved Escape; releasing mouse lock still sends Escape to Windows.");}}
+document.addEventListener("fullscreenchange",syncKeyboardLock);
+ui.blank.addEventListener("click",function(){var popup=window.open("about:blank","_blank");if(!popup){put("status","Popup blocked. Allow popups for this page, then try again.");return;}wantConnection=false;if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}cleanup(true);var source="<!doctype html>\n"+document.documentElement.outerHTML;popup.document.open();popup.document.write(source);popup.document.close();popup.document.getElementById("host").value=ui.host.value;popup.document.getElementById("secret").value=ui.secret.value;popup.document.getElementById("network").value=ui.network.value;popup.document.getElementById("clientToken").value=ui.clientToken.value;popup.focus();try{var promise=popup.document.documentElement.requestFullscreen();if(promise&&promise.catch){promise.catch(function(){});}}catch(e){}popup.document.getElementById("connect").click();put("status","Opened about:blank. If it is not fullscreen, click Fullscreen in that tab.");});
+ui.host.addEventListener("keydown",function(e){if(e.key==="Enter"){connect(true);}});ui.secret.addEventListener("keydown",function(e){if(e.key==="Enter"){connect(true);}});load();soundUi();updateKeyboardSwap();updateMouseUi();updateScrollUi();updatePictureSize();updateDebug();
+})();
+</script>
+</body>
+</html>
