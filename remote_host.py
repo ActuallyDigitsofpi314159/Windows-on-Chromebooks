@@ -1,6 +1,9 @@
 import asyncio
+import base64
 import ctypes
 import fractions
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -26,22 +29,27 @@ from pynput.keyboard import Controller as KeyboardController, Key, KeyCode
 from pynput.mouse import Controller as MouseController, Button
 
 HOST = "127.0.0.1"
+BIND_HOST = os.environ.get("DK_BIND_HOST", HOST)
 PORT = 8765
-BUILD_VERSION = "2026.10.06.1"
+BUILD_VERSION = "2026.10.24.3"
+IS_MAC = sys.platform == "darwin"
 FPS = int(os.environ.get("DK_FPS", "60"))
 WIDTH = 1366
 HEIGHT = 768
-# In virtual mode, identify the MttVDD monitor by its PnP identity each time.
-# A manual DXGI index can still be used for troubleshooting.
-CAPTURE_DISPLAY = os.environ.get("DK_CAPTURE_DISPLAY", "virtual").lower()
-if CAPTURE_DISPLAY not in ("virtual", "manual"):
-    raise ValueError("DK_CAPTURE_DISPLAY must be 'virtual' or 'manual'")
+# Capture the physical primary display by default. Virtual mode identifies the
+# MttVDD monitor by PnP identity; manual mode selects a DXGI adapter/output.
+CAPTURE_DISPLAY = os.environ.get("DK_CAPTURE_DISPLAY", "primary").lower()
+if CAPTURE_DISPLAY not in ("primary", "virtual", "manual"):
+    raise ValueError("DK_CAPTURE_DISPLAY must be 'primary', 'virtual', or 'manual'")
 DISPLAY_OUTPUT_INDEX = int(os.environ.get("DK_DISPLAY_OUTPUT_INDEX", "0"))
-# Direct mode keeps D3D11 capture frames on the GPU. The selected desktop
-# is set to the controller's resolution before opening capture.
+DISPLAY_ADAPTER_INDEX = int(os.environ.get("DK_DISPLAY_ADAPTER_INDEX", "0"))
+MAC_SCREEN_INDEX = int(os.environ.get("DK_MAC_SCREEN_INDEX", "0"))
+# Direct mode keeps D3D11 capture frames on the GPU. Only virtual capture
+# changes the Windows display mode; other displays must already match.
 CAPTURE_MODE = os.environ.get("DK_CAPTURE_MODE", "direct").lower()
 if CAPTURE_MODE not in ("direct", "scale"):
     raise ValueError("DK_CAPTURE_MODE must be 'direct' or 'scale'")
+CAPTURE_LABEL = "avfoundation" if IS_MAC else CAPTURE_MODE
 BITRATE = os.environ.get("DK_BITRATE", "14M")
 MAXRATE = os.environ.get("DK_MAXRATE", "20M")
 # Four frames of peak bitrate leave more room for keyframes, reducing the
@@ -50,6 +58,18 @@ VBV_BUFFER = os.environ.get("DK_VBV_BUFFER")
 RATE_MODE = os.environ.get("DK_RATE_MODE", "vbr").lower()
 if RATE_MODE not in ("vbr", "cbr"):
     raise ValueError("DK_RATE_MODE must be 'vbr' or 'cbr'")
+# Quarter-resolution multipass gives NVENC more information for bit allocation
+# within the small VBV. Single-pass remains available for measured bottlenecks.
+NVENC_MULTIPASS = os.environ.get("DK_NVENC_MULTIPASS", "qres").lower()
+if NVENC_MULTIPASS not in ("disabled", "qres"):
+    raise ValueError("DK_NVENC_MULTIPASS must be 'disabled' or 'qres'")
+ENCODER_PREFERENCE = os.environ.get("DK_ENCODER", "auto").lower()
+ENCODER_NAMES = {"nvenc": "h264_nvenc", "amf": "h264_amf",
+                 "mf": "h264_mf", "qsv": "h264_qsv",
+                 "videotoolbox": "h264_videotoolbox"}
+if ENCODER_PREFERENCE not in ("auto", *ENCODER_NAMES):
+    raise ValueError("DK_ENCODER must be auto, nvenc, amf, mf, qsv, or videotoolbox")
+ENCODER_CANDIDATES = []
 # Historical DK_CQ now selects the initial VBR quantizer. FFmpeg's -cq mode
 # disables the explicitly configured VBV, which is unsuitable for this path.
 CQ = int(os.environ.get("DK_CQ", "14"))
@@ -57,7 +77,8 @@ if not 0 <= CQ <= 51:
     raise ValueError("DK_CQ must be between 0 and 51")
 EFFECTIVE_RATE_MODE = RATE_MODE
 QUALITY_MODE = "sharp"
-AUDIO_ENABLED = True
+MAC_AUDIO_DEVICE = os.environ.get("DK_MAC_AUDIO_DEVICE", "BlackHole 2ch")
+AUDIO_ENABLED = not IS_MAC
 GOP = int(os.environ.get("DK_GOP", str(max(1, FPS))))
 if FPS < 1 or GOP < 1:
     raise ValueError("DK_FPS and DK_GOP must be positive integers")
@@ -74,6 +95,9 @@ try:
         QUALITY_MODE = saved_settings["quality"]
     if isinstance(saved_settings, dict) and isinstance(saved_settings.get("audio"), bool):
         AUDIO_ENABLED = saved_settings["audio"]
+    if (not IS_MAC and "DK_CAPTURE_DISPLAY" not in os.environ and
+            isinstance(saved_settings, dict) and saved_settings.get("display") in ("primary", "virtual", "manual")):
+        CAPTURE_DISPLAY = saved_settings["display"]
 except (OSError, ValueError, TypeError):
     pass
 
@@ -120,6 +144,29 @@ def request_admin_restart():
         args.append("--wait-for-host")
     result = shell(None, "runas", sys.executable, subprocess.list2cmdline(args), str(BASE), 1)
     return result is not None and result > 32
+
+
+def quick_tunnel_url(message):
+    match = re.search(r"https://([a-zA-Z0-9-]+)\.trycloudflare\.com\b", message)
+    if match and match.group(1).lower() not in ("api", "www"):
+        return match.group(0)
+    return None
+
+
+def connection_code(hostname):
+    hostname = hostname.lower()
+    if len(hostname) > 253 or not re.fullmatch(r"[a-z0-9.-]+(?::[0-9]{1,5})?", hostname):
+        raise ValueError("Invalid connection host")
+    proof = hmac.new(SECRET.encode("utf-8"), b"dk1\0" + hostname.encode("ascii"),
+                     hashlib.sha256).digest()[:16]
+    return "dk1." + base64.urlsafe_b64encode(proof).decode("ascii").rstrip("=")
+
+
+def connection_link(address):
+    match = re.fullmatch(r"https://([a-z0-9-]+\.trycloudflare\.com)/?", address.lower())
+    if not match:
+        raise ValueError("Expected a Cloudflare tunnel address")
+    return "https://" + match.group(1) + "/#" + connection_code(match.group(1))
 
 
 class LowDelayExtensions:
@@ -222,8 +269,9 @@ def controller_resolution(screen):
     if (type(width) not in (int, float) or type(height) not in (int, float) or
             not 320 <= width <= 8192 or not 200 <= height <= 4320):
         raise ValueError("Controller screen dimensions are invalid")
-    # H.264 4:2:0 requires even dimensions; this changes odd sizes by one pixel.
-    return int(round(width / 2)) * 2, int(round(height / 2)) * 2
+    if int(width) != width or int(height) != height:
+        raise ValueError("Receiver screen dimensions must be whole pixels")
+    return int(width), int(height)
 
 
 def ranked_display_modes(modes, requested):
@@ -267,7 +315,12 @@ def set_virtual_resolution(selected, requested):
             break
         modes.append(mode)
         index += 1
-    for mode in ranked_display_modes(modes, requested):
+    exact_modes = [mode for mode in ranked_display_modes(modes, requested)
+                   if (mode.dmPelsWidth, mode.dmPelsHeight) == requested]
+    if not exact_modes:
+        raise RuntimeError(f"Virtual display has no exact {requested[0]}x{requested[1]} mode. "
+                           "Add that resolution in Virtual Driver Control, then reconnect.")
+    for mode in exact_modes:
         # Retain desktop position and orientation from the current mode.
         target = DisplayMode.from_buffer_copy(current)
         target.dmPelsWidth, target.dmPelsHeight = mode.dmPelsWidth, mode.dmPelsHeight
@@ -278,30 +331,33 @@ def set_virtual_resolution(selected, requested):
             continue
         if change(selected["name"], ctypes.byref(target), None, 0, None) == 0:
             return target.dmPelsWidth, target.dmPelsHeight
-    print("[display] No supported mode could be applied; retaining the current virtual resolution.")
-    return current.dmPelsWidth, current.dmPelsHeight
+    raise RuntimeError(f"Windows could not apply exact virtual display mode {requested[0]}x{requested[1]}. "
+                       "Check Virtual Driver Control and reconnect.")
 
 
 async def capture_for_controller(requested):
     selected = await asyncio.to_thread(select_capture_display)
-    if CAPTURE_DISPLAY == "virtual" and not sessions:
-        target = await asyncio.to_thread(set_virtual_resolution, selected, requested)
-        # DXGI output indexes/bounds can change when Windows changes a mode.
-        # Re-enumerate by virtual monitor identity before opening ddagrab.
-        for _ in range(30):
-            selected = await asyncio.to_thread(select_capture_display)
-            if (selected["width"], selected["height"]) == target:
-                break
-            await asyncio.sleep(0.1)
+    if not IS_MAC and CAPTURE_DISPLAY == "virtual" and not sessions and all(size % 2 == 0 for size in requested):
+        try:
+            target = await asyncio.to_thread(set_virtual_resolution, selected, requested)
+        except RuntimeError as exc:
+            print("[display] Exact virtual mode unavailable; using current mode:", exc)
         else:
-            raise RuntimeError("Windows has not finished applying the virtual display mode")
+            # DXGI output indexes/bounds can change when Windows changes a mode.
+            for _ in range(30):
+                selected = await asyncio.to_thread(select_capture_display)
+                if (selected["width"], selected["height"]) == target:
+                    break
+                await asyncio.sleep(0.1)
     selected["requestedWidth"], selected["requestedHeight"] = requested
     actual = selected["width"], selected["height"]
-    selected["resolutionNote"] = ("" if actual == requested else
-        f"Controller requested {requested[0]}×{requested[1]}; streaming {actual[0]}×{actual[1]}. " +
-        ("Another controller is using the virtual display." if sessions else
-         "This is the closest usable mode offered by the virtual display driver."))
-    print(f'[display] Controller {requested[0]}x{requested[1]} → stream {actual[0]}x{actual[1]}')
+    if actual != requested:
+        selected["resolutionNote"] = (f"Host {actual[0]}x{actual[1]} differs from receiver "
+                                      f"{requested[0]}x{requested[1]}; fitting the picture. "
+                                      "Matching resolutions gives the sharpest image.")
+    else:
+        selected["resolutionNote"] = "Host and receiver pixel dimensions match"
+    print(f'[display] Controller {requested[0]}x{requested[1]} -> stream {actual[0]}x{actual[1]}')
     return selected
 
 
@@ -340,6 +396,27 @@ def windows_virtual_monitors():
             monitor_index += 1
         adapter_index += 1
     return monitors
+
+
+def windows_primary_display_name():
+    user32 = ctypes.windll.user32
+    enum = user32.EnumDisplayDevicesW
+    enum.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong,
+                     ctypes.POINTER(DisplayDevice), ctypes.c_ulong]
+    enum.restype = ctypes.c_int
+    names = []
+    index = 0
+    while True:
+        adapter = DisplayDevice()
+        adapter.cb = ctypes.sizeof(adapter)
+        if not enum(None, index, ctypes.byref(adapter), 0):
+            break
+        if adapter.StateFlags & 0x4:  # DISPLAY_DEVICE_PRIMARY_DEVICE
+            names.append(adapter.DeviceName.upper())
+        index += 1
+    if len(names) != 1:
+        raise RuntimeError("Windows did not identify exactly one primary display. Check Display settings.")
+    return names[0]
 
 
 def dxgi_outputs():
@@ -393,10 +470,30 @@ def dxgi_outputs():
 
 
 def select_capture_display():
+    if IS_MAC:
+        return select_mac_display()
+    if CAPTURE_DISPLAY == "primary":
+        primary_name = windows_primary_display_name()
+        matches = [output for output in dxgi_outputs()
+                   if output["name"] == primary_name]
+        if len(matches) != 1:
+            raise RuntimeError("Could not identify the primary Windows display. Check Display settings "
+                               "or choose a display manually.")
+        selected = dict(matches[0], identity="primary display")
+        bounds = selected["bounds"]
+        selected["width"], selected["height"] = bounds[2] - bounds[0], bounds[3] - bounds[1]
+        return selected
     if CAPTURE_DISPLAY == "manual":
-        return {"adapter": 0, "output": DISPLAY_OUTPUT_INDEX,
-                "name": "manual DXGI selection", "bounds": None, "identity": "manual",
-                "width": WIDTH, "height": HEIGHT}
+        matches = [output for output in dxgi_outputs()
+                   if output["adapter"] == DISPLAY_ADAPTER_INDEX and
+                   output["output"] == DISPLAY_OUTPUT_INDEX]
+        if len(matches) != 1:
+            raise RuntimeError("Manual DXGI adapter/output was not found. Check DK_DISPLAY_ADAPTER_INDEX "
+                               "and DK_DISPLAY_OUTPUT_INDEX.")
+        selected = dict(matches[0], identity="manual display")
+        bounds = selected["bounds"]
+        selected["width"], selected["height"] = bounds[2] - bounds[0], bounds[3] - bounds[1]
+        return selected
     monitors = windows_virtual_monitors()
     matches = [dict(output, identity=monitors[output["name"]])
                for output in dxgi_outputs() if output["name"] in monitors]
@@ -409,6 +506,47 @@ def select_capture_display():
     bounds = selected["bounds"]
     selected["width"], selected["height"] = bounds[2] - bounds[0], bounds[3] - bounds[1]
     return selected
+
+
+class MacPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+class MacSize(ctypes.Structure):
+    _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+
+class MacRect(ctypes.Structure):
+    _fields_ = [("origin", MacPoint), ("size", MacSize)]
+
+
+def select_mac_display():
+    """Use the same CoreGraphics screen order as FFmpeg's AVFoundation input."""
+    core = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+    core.CGGetActiveDisplayList.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+                                            ctypes.POINTER(ctypes.c_uint32)]
+    core.CGGetActiveDisplayList.restype = ctypes.c_int32
+    core.CGDisplayPixelsWide.argtypes = [ctypes.c_uint32]
+    core.CGDisplayPixelsWide.restype = ctypes.c_size_t
+    core.CGDisplayPixelsHigh.argtypes = [ctypes.c_uint32]
+    core.CGDisplayPixelsHigh.restype = ctypes.c_size_t
+    core.CGDisplayBounds.argtypes = [ctypes.c_uint32]
+    core.CGDisplayBounds.restype = MacRect
+    count = ctypes.c_uint32()
+    displays = (ctypes.c_uint32 * 32)()
+    if core.CGGetActiveDisplayList(32, displays, ctypes.byref(count)) != 0:
+        raise RuntimeError("Could not list Mac displays")
+    if not 0 <= MAC_SCREEN_INDEX < count.value:
+        raise RuntimeError(f"DK_MAC_SCREEN_INDEX={MAC_SCREEN_INDEX} is unavailable; "
+                           f"this Mac has {count.value} active display(s).")
+    display = displays[MAC_SCREEN_INDEX]
+    rect = core.CGDisplayBounds(display)
+    left, top = round(rect.origin.x), round(rect.origin.y)
+    right, bottom = round(rect.origin.x + rect.size.width), round(rect.origin.y + rect.size.height)
+    return {"adapter": 0, "output": MAC_SCREEN_INDEX, "name": f"Capture screen {MAC_SCREEN_INDEX}",
+            "identity": f"CoreGraphics display {display}", "bounds": (left, top, right, bottom),
+            "width": int(core.CGDisplayPixelsWide(display)),
+            "height": int(core.CGDisplayPixelsHigh(display))}
 
 
 class MouseInput(ctypes.Structure):
@@ -518,9 +656,9 @@ class HostInputState:
         if token is None:
             if os.name == "nt" and code in CODE_VK:
                 token = ("vk", CODE_VK[code])
-            elif name == "Escape":
+            elif os.name == "nt" and name == "Escape":
                 token = ("vk", 0x1B)
-            elif name in ("`", "~"):
+            elif os.name == "nt" and name in ("`", "~"):
                 token = ("vk", 0xC0)
             else:
                 key = resolve_key(name)
@@ -560,6 +698,13 @@ class HostInputState:
         line_pixels = max(8.0, min(64.0, float(line_pixels)))
         for axis, pixels in enumerate((dx, dy)):
             pixels = max(-10000.0, min(10000.0, float(pixels)))
+            if os.name != "nt":
+                total = self.scroll_remainder[axis] + pixels / line_pixels
+                steps = int(total)
+                self.scroll_remainder[axis] = total - steps
+                if steps:
+                    mouse.scroll(steps if axis == 0 else 0, -steps if axis == 1 else 0)
+                continue
             amount = windows_scroll_amount(horizontal=axis == 0)
             if amount == 0:
                 continue
@@ -572,14 +717,8 @@ class HostInputState:
             self.scroll_remainder[axis] = total - whole
             if not whole:
                 continue
-            if os.name == "nt":
-                flags = 0x1000 if axis == 0 else 0x0800
-                inject_event(Input(0, InputUnion(mi=MouseInput(0, 0, whole & 0xFFFFFFFF, flags, 0, 0))))
-            else:
-                # Non-Windows fallback receives whole notches.
-                notches = int(whole / 120)
-                if notches:
-                    mouse.scroll(notches if axis == 0 else 0, notches if axis == 1 else 0)
+            flags = 0x1000 if axis == 0 else 0x0800
+            inject_event(Input(0, InputUnion(mi=MouseInput(0, 0, whole & 0xFFFFFFFF, flags, 0, 0))))
 
 
 def host_mouse_state(selected=None):
@@ -605,8 +744,11 @@ def move_mouse_relative(dx, dy):
     dx = max(-2048, min(2048, int(dx)))
     dy = max(-2048, min(2048, int(dy)))
     if dx or dy:
-        event = Input(0, InputUnion(mi=MouseInput(dx, dy, 0, 0x0001, 0, 0)))
-        inject_event(event)
+        if os.name == "nt":
+            event = Input(0, InputUnion(mi=MouseInput(dx, dy, 0, 0x0001, 0, 0)))
+            inject_event(event)
+        else:
+            mouse.move(dx, dy)
 
 
 class LatestH264Track(MediaStreamTrack):
@@ -720,7 +862,7 @@ class LatestH264Track(MediaStreamTrack):
 
 
 class SpeakerLoopbackTrack(MediaStreamTrack):
-    """Capture the Windows default playback endpoint without blocking the event loop."""
+    """Capture the configured host audio source without blocking the event loop."""
 
     kind = "audio"
     RATE = 48000
@@ -779,14 +921,20 @@ class SpeakerLoopbackTrack(MediaStreamTrack):
         try:
             import soundcard as sc
             import numpy as np
-            speaker = sc.default_speaker()
-            if speaker is None:
-                raise RuntimeError("Windows has no default playback device")
-            microphone = sc.get_microphone(speaker.id, include_loopback=True)
-            if microphone is None or not microphone.isloopback:
-                raise RuntimeError("WASAPI loopback for the default speaker was not found")
-            self.device = speaker.name
-            print("[audio] Capturing default playback device:", self.device)
+            if IS_MAC:
+                microphone = sc.get_microphone(MAC_AUDIO_DEVICE)
+                if microphone is None:
+                    raise RuntimeError(f"Mac audio input {MAC_AUDIO_DEVICE!r} was not found. Install BlackHole 2ch.")
+                self.device = microphone.name
+            else:
+                speaker = sc.default_speaker()
+                if speaker is None:
+                    raise RuntimeError("Windows has no default playback device")
+                microphone = sc.get_microphone(speaker.id, include_loopback=True)
+                if microphone is None or not microphone.isloopback:
+                    raise RuntimeError("WASAPI loopback for the default speaker was not found")
+                self.device = speaker.name
+            print("[audio] Capturing host audio source:", self.device)
             # WASAPI may ignore the requested blocksize. Keep the queue bounded
             # so delayed capture never accumulates stale sound.
             with microphone.recorder(samplerate=self.RATE, channels=2, blocksize=960) as recorder:
@@ -870,6 +1018,9 @@ def resolve_key(name):
 
 
 def screen_size():
+    if IS_MAC:
+        left, top, right, bottom = select_mac_display()["bounds"]
+        return right - left, bottom - top
     user32 = ctypes.windll.user32
     try:
         user32.SetProcessDPIAware()
@@ -881,38 +1032,55 @@ def screen_size():
 def ffmpeg_path():
     path = shutil.which("ffmpeg")
     if not path:
-        raise RuntimeError("ffmpeg not found. Install it with: winget install -e --id Gyan.FFmpeg")
+        hint = "brew install ffmpeg" if IS_MAC else "winget install -e --id Gyan.FFmpeg"
+        raise RuntimeError("ffmpeg not found. Install it with: " + hint)
     return path
 
 
 def check_ffmpeg(exe):
-    global EFFECTIVE_RATE_MODE
+    global ENCODER_CANDIDATES
     try:
-        filters = subprocess.run([exe, "-hide_banner", "-filters"],
-                                 capture_output=True, text=True, timeout=10)
         encoders = subprocess.run([exe, "-hide_banner", "-encoders"],
                                   capture_output=True, text=True, timeout=10)
-        encoder_options = subprocess.run([exe, "-hide_banner", "-h", "encoder=h264_nvenc"],
-                                         capture_output=True, text=True, timeout=10)
+        if IS_MAC:
+            devices = subprocess.run([exe, "-hide_banner", "-devices"],
+                                     capture_output=True, text=True, timeout=10)
+        else:
+            filters = subprocess.run([exe, "-hide_banner", "-filters"],
+                                     capture_output=True, text=True, timeout=10)
+            encoder_options = subprocess.run([exe, "-hide_banner", "-h", "encoder=h264_nvenc"],
+                                             capture_output=True, text=True, timeout=10)
     except Exception as exc:
         raise RuntimeError("Could not inspect FFmpeg: " + str(exc))
-    filter_text = filters.stdout + filters.stderr
     encoder_text = encoders.stdout + encoders.stderr
-    missing = []
-    required_filters = ("ddagrab", "scale") if CAPTURE_MODE == "scale" else ("ddagrab",)
-    for name in required_filters:
-        if name not in filter_text:
-            missing.append(name)
-    if "h264_nvenc" not in encoder_text:
-        missing.append("h264_nvenc")
-    if missing:
-        raise RuntimeError("FFmpeg is missing required support: " + ", ".join(missing))
-    help_text = encoder_options.stdout + encoder_options.stderr
-    if RATE_MODE == "vbr" and (encoder_options.returncode != 0 or
-                               not re.search(r"(?m)^\s+-init_qpP\s", help_text) or
-                               not re.search(r"(?m)^\s+vbr\s", help_text)):
-        EFFECTIVE_RATE_MODE = "cbr"
-        print("[capture] This FFmpeg build lacks NVENC bounded VBR; using CBR quality fallback.")
+    if IS_MAC:
+        if "avfoundation" not in devices.stdout + devices.stderr:
+            raise RuntimeError("FFmpeg is missing AVFoundation screen capture. Install Homebrew FFmpeg.")
+    else:
+        filter_text = filters.stdout + filters.stderr
+        missing = []
+        required_filters = ("ddagrab",)
+        for name in required_filters:
+            if name not in filter_text:
+                missing.append(name)
+        if missing:
+            raise RuntimeError("FFmpeg is missing required support: " + ", ".join(missing))
+    available = [name for name, codec in ENCODER_NAMES.items()
+                 if re.search(r"(?m)^\s*V[^\n]*\s" + re.escape(codec) + r"\s", encoder_text)]
+    available = [name for name in available if (name == "videotoolbox") == IS_MAC]
+    if not IS_MAC and "nvenc" in available and RATE_MODE == "vbr":
+        help_text = encoder_options.stdout + encoder_options.stderr
+        if (encoder_options.returncode != 0 or
+                not re.search(r"(?m)^\s+-init_qpP\s", help_text) or
+                not re.search(r"(?m)^\s+vbr\s", help_text)):
+            available.remove("nvenc")
+            print("[capture] NVENC bounded VBR is unavailable in this FFmpeg build.")
+    ENCODER_CANDIDATES = ([name for name in ENCODER_NAMES if name in available]
+                          if ENCODER_PREFERENCE == "auto" else
+                          [ENCODER_PREFERENCE] if ENCODER_PREFERENCE in available else [])
+    if not ENCODER_CANDIDATES:
+        raise RuntimeError("No requested H.264 hardware encoder is available in FFmpeg. "
+                           "Install the full FFmpeg build or choose DK_ENCODER=auto.")
     return True
 
 
@@ -942,35 +1110,53 @@ def video_settings(quality, bitrate_cap=None):
 def build_ffmpeg(selected, quality="sharp", bitrate_cap=None):
     exe = FFMPEG_EXE or ffmpeg_path()
     video = video_settings(quality, bitrate_cap)
-    width, height = selected.get("width", WIDTH), selected.get("height", HEIGHT)
+    encoder = selected.get("encoder", ENCODER_CANDIDATES[0] if ENCODER_CANDIDATES else "nvenc")
     command = [exe, "-hide_banner", "-loglevel", "warning",
             "-fflags", "nobuffer", "-flags", "low_delay"]
-    if selected["adapter"]:
+    if IS_MAC:
+        command += ["-f", "avfoundation", "-framerate", str(FPS),
+                    "-capture_cursor", "0", "-i", f'Capture screen {selected["output"]}:none']
+    elif selected["adapter"]:
         command += ["-init_hw_device", f'd3d11va=cap:{selected["adapter"]}',
                     "-filter_hw_device", "cap"]
-    command += [
-            "-f", "lavfi", "-i",
-            f'ddagrab=output_idx={selected["output"]}:framerate={FPS}:draw_mouse=0']
-    if CAPTURE_MODE == "scale":
-        # Reliable fallback for FFmpeg builds where D3D11 scaling fails.
-        command += ["-filter_threads", "1", "-vf",
-                    f"hwdownload,format=bgra,scale={width}:{height}:flags=fast_bilinear,format=nv12"]
+    if not IS_MAC:
+        command += ["-f", "lavfi", "-i",
+                    f'ddagrab=output_idx={selected["output"]}:framerate={FPS}:draw_mouse=0']
+        if CAPTURE_MODE == "scale":
+            # Software pixel-format conversion preserves the exact dimensions.
+            command += ["-filter_threads", "1", "-vf", "hwdownload,format=bgra,format=nv12"]
+        elif encoder == "qsv":
+            # QSV accepts NV12 system memory on builds where D3D11-to-QSV mapping
+            # is unavailable. Convert color format without changing pixel count.
+            command += ["-filter_threads", "1", "-vf", "hwdownload,format=bgra,format=nv12"]
     # ddagrab timestamps are irregular microsecond capture times. Rounding
     # them to the default 1/FPS encoder clock can collapse adjacent frames
     # into one DTS tick under load. Preserve them on the RTP/MPEG-TS clock.
     command += ["-fps_mode", "vfr", "-enc_time_base:v", "1:90000",
-            "-an", "-c:v", "h264_nvenc", "-preset", "p4", "-tune", "ull",
-            "-profile:v", "baseline",
-            "-rc", EFFECTIVE_RATE_MODE, "-b:v", video["bitrate"],
+            "-an", "-c:v", ENCODER_NAMES[encoder], "-profile:v", "baseline",
+            "-b:v", video["bitrate"],
             "-maxrate", video["maxrate"] if EFFECTIVE_RATE_MODE == "vbr" else video["bitrate"],
-            "-bufsize", video["buffer"], "-g", str(GOP), "-bf", "0",
-            "-rc-lookahead", "0", "-delay", "0", "-zerolatency", "1",
-            "-forced-idr", "1", "-multipass", "qres"]
-    if EFFECTIVE_RATE_MODE == "vbr":
-        # NVENC CQ in FFmpeg clears averageBitRate AND vbvBufferSize, even
-        # with explicit -b:v / -bufsize. Use bitrate-controlled VBR instead.
-        # Retain DK_CQ as the starting I/P quantizer, without disabling VBV.
-        command += ["-init_qpI", str(video["cq"]), "-init_qpP", str(video["cq"])]
+            "-bufsize", video["buffer"], "-g", str(GOP), "-bf", "0"]
+    if encoder == "nvenc":
+        command += ["-preset", "p4", "-tune", "ull", "-rc", EFFECTIVE_RATE_MODE,
+                    "-rc-lookahead", "0", "-delay", "0", "-zerolatency", "1",
+                    "-forced-idr", "1", "-multipass", NVENC_MULTIPASS]
+        if EFFECTIVE_RATE_MODE == "vbr":
+            # NVENC -cq clears explicit VBV settings in FFmpeg. Keep bounded
+            # VBR and use the configured initial quantizer instead.
+            command += ["-init_qpI", str(video["cq"]), "-init_qpP", str(video["cq"])]
+    elif encoder == "amf":
+        command += ["-usage", "lowlatency", "-quality", "quality", "-latency", "1",
+                    "-rc", "vbr_latency" if EFFECTIVE_RATE_MODE == "vbr" else "cbr"]
+    elif encoder == "mf":
+        command += ["-hw_encoding", "1", "-scenario", "display_remoting",
+                    "-rate_control", "ld_vbr" if EFFECTIVE_RATE_MODE == "vbr" else "cbr"]
+    elif encoder == "qsv":
+        command += ["-preset", "medium", "-low_delay_brc", "1"]
+    elif encoder == "videotoolbox":
+        # AVFoundation captures native display pixels; VT converts to NV12 for H.264.
+        # Keep the default quality priority while requesting realtime hardware encode.
+        command += ["-pix_fmt", "nv12", "-allow_sw", "0", "-realtime", "1"]
     command += [
             "-flush_packets", "1",
             "-f", "mpegts", "-mpegts_flags", "initial_discontinuity",
@@ -1081,6 +1267,16 @@ class CaptureProcess:
             capture.player = await asyncio.wait_for(asyncio.shield(opening), timeout=8)
             if capture.player.video is None:
                 raise RuntimeError("Capture did not expose an H.264 video track")
+            container = capture.player._MediaPlayer__container
+            encoded = next((stream for stream in container.streams if stream.type == "video"), None)
+            if encoded is not None:
+                dimensions = encoded.codec_context.width, encoded.codec_context.height
+                expected = selected["width"], selected["height"]
+                if all(dimensions) and dimensions != expected:
+                    selected["resolutionNote"] = (
+                        f"Stream is {dimensions[0]}x{dimensions[1]}; host display is "
+                        f"{expected[0]}x{expected[1]}. Streaming continues with the picture fitted to the receiver.")
+                    print("[display] Warning:", selected["resolutionNote"])
             capture.player._throttle_playback = False
             return capture
         except BaseException:
@@ -1129,8 +1325,19 @@ class CapturePipeline:
             # initial cap is reserved for adaptive streams that may tune it.
             rate.cap = rate.maximum
             rate.initial_cap = rate.maximum
-        capture = await CaptureProcess.open(selected, quality, rate.cap)
-        return cls(selected, quality, capture, rate)
+        errors = []
+        for encoder in ENCODER_CANDIDATES:
+            candidate = dict(selected, encoder=encoder)
+            try:
+                capture = await CaptureProcess.open(candidate, quality, rate.cap)
+            except Exception as exc:
+                errors.append(f"{encoder}: {exc}")
+                print(f"[capture] {encoder} unavailable: {exc}")
+                continue
+            selected["encoder"] = encoder
+            print(f"[capture] Using {ENCODER_NAMES[encoder]} hardware encoder")
+            return cls(selected, quality, capture, rate)
+        raise RuntimeError("No H.264 hardware encoder started. " + "; ".join(errors))
 
     async def adapt(self):
         while not self.closed:
@@ -1228,13 +1435,19 @@ async def release_host_pointer_and_escape(channel, input_state=None, key_name="E
                 keyboard.release(modifier)
         if os.name == "nt":
             ctypes.windll.user32.ClipCursor(None)
-        # The Chromebook already mapped this key. The host never swaps it.
-        escape_vk = 0xC0 if key_name in ("`", "~") else 0x1B
-        inject_virtual_key(escape_vk, True)
+        # The browser already mapped this key. The host never swaps it.
+        escape_key = "`" if key_name in ("`", "~") else Key.esc
+        if os.name == "nt":
+            inject_virtual_key(0xC0 if key_name in ("`", "~") else 0x1B, True)
+        else:
+            keyboard.press(escape_key)
         try:
             await asyncio.sleep(0.16)
         finally:
-            inject_virtual_key(escape_vk, False)
+            if os.name == "nt":
+                inject_virtual_key(0xC0 if key_name in ("`", "~") else 0x1B, False)
+            else:
+                keyboard.release(escape_key)
             if os.name == "nt":
                 ctypes.windll.user32.ClipCursor(None)
         if channel.readyState == "open":
@@ -1284,7 +1497,8 @@ def _handle_control_message(channel, raw, track=None, selected=None, audio=None,
         video = video_settings(quality, pipeline.rate.cap if pipeline else None)
         if channel.readyState == "open":
             channel.send(json.dumps({"type": "pong", "id": msg.get("id")}))
-            channel.send(json.dumps({"type": "host_info", "captureMode": CAPTURE_MODE,
+            channel.send(json.dumps({"type": "host_info", "captureMode": CAPTURE_LABEL,
+                                     "hostPlatform": "macOS" if IS_MAC else "Windows",
                                      "hostBuild": BUILD_VERSION,
                                      "fps": FPS, "targetWidth": selected.get("width", WIDTH) if selected else WIDTH,
                                      "targetHeight": selected.get("height", HEIGHT) if selected else HEIGHT,
@@ -1301,6 +1515,8 @@ def _handle_control_message(channel, raw, track=None, selected=None, audio=None,
                                      "skippedPackets": track.skipped if track else None,
                                      "hostPacketRate": track.sent_rate() if track else None,
                                      "gop": GOP, "vbvBuffer": video["buffer"],
+                                     "encoder": selected.get("encoder") if selected else None,
+                                     "multipass": NVENC_MULTIPASS if selected and selected.get("encoder") == "nvenc" else None,
                                      "rateMode": EFFECTIVE_RATE_MODE, "maxrate": video["maxrate"],
                                      "streamMode": "adaptive" if pipeline and pipeline.task is not None else "stable",
                                      "rateNote": pipeline.rate.reason if pipeline else "Fixed bitrate",
@@ -1374,7 +1590,7 @@ async def cors_middleware(request, handler):
     else:
         response = await handler(request)
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Remote-Secret"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Remote-Secret, X-Remote-Host"
     response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -1393,8 +1609,9 @@ async def health(_request):
                               "hostBuild": BUILD_VERSION,
                               "fps": FPS, "width": width, "height": height,
                               "bitrate": BITRATE, "display": display,
-                              "capture": "DXGI/ddagrab + " + ("direct NVENC" if CAPTURE_MODE == "direct" else "CPU scale + NVENC"),
-                              "captureMode": CAPTURE_MODE})
+                              "capture": ("AVFoundation + hardware H.264" if IS_MAC else
+                                          "DXGI/ddagrab + hardware H.264"),
+                              "captureMode": CAPTURE_LABEL})
 
 
 async def client_page(_request):
@@ -1426,8 +1643,15 @@ def select_client_page(base):
 
 async def offer(request):
     supplied_secret = request.headers.get("X-Remote-Secret", "")
-    if not secrets.compare_digest(supplied_secret, SECRET):
-        return web.json_response({"error": "Bad secret"}, status=403)
+    authorized = secrets.compare_digest(supplied_secret, SECRET)
+    if not authorized and supplied_secret.startswith("dk1."):
+        try:
+            authorized = secrets.compare_digest(
+                supplied_secret, connection_code(request.headers.get("X-Remote-Host", "")))
+        except ValueError:
+            pass
+    if not authorized:
+        return web.json_response({"error": "Invalid connection code"}, status=403)
     try:
         params = await request.json()
         remote_offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
@@ -1469,7 +1693,7 @@ async def create_session(request, params, remote_offer, requested_resolution,
         print("[capture]", exc)
         return web.json_response({"error": str(exc)}, status=503)
     print(f'[capture] {selected["name"]} ({selected["identity"]}) '
-          f'=> DXGI adapter {selected["adapter"]} output {selected["output"]}')
+          f'=> {"AVFoundation screen" if IS_MAC else "DXGI adapter/output"} {selected["output"]}')
 
     pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=[
         RTCIceServer(urls="stun:stun.cloudflare.com:3478")]))
@@ -1493,14 +1717,14 @@ async def create_session(request, params, remote_offer, requested_resolution,
         pcs.discard(pc)
         print("[capture] Could not open FFmpeg video stream:", repr(exc))
         return web.json_response({
-            "error": "Capture startup failed. Check the [ffmpeg] lines in the host console; "
-                     "the DXGI/scaler/encoder stage stopped before video reached PyAV."
+            "error": "Capture startup failed: " + str(exc)[:500] +
+                     ". Check the [ffmpeg] lines in the host console."
         }, status=502)
 
     audio_track = None
     if AUDIO_ENABLED:
         try:
-            import soundcard  # noqa: F401; validates the optional Windows audio dependency.
+            import soundcard  # noqa: F401; validates the audio dependency.
             audio_track = SpeakerLoopbackTrack(asyncio.get_running_loop())
             audio_sender = pc.addTrack(audio_track)
             # Independent streams prevent speaker buffering from forcing the
@@ -1508,7 +1732,7 @@ async def create_session(request, params, remote_offer, requested_resolution,
             if hasattr(audio_sender, "_stream_id"):
                 audio_sender._stream_id = str(uuid.uuid4())
         except Exception as exc:
-            print("[audio] Unavailable:", exc, "— install with: python3 -m pip install soundcard numpy")
+            print("[audio] Unavailable:", exc, "- install with: python3 -m pip install soundcard numpy")
 
     input_state = HostInputState(page_height=selected["height"])
     sessions[session_id] = {"pc": pc, "pipeline": pipeline,
@@ -1526,7 +1750,8 @@ async def create_session(request, params, remote_offer, requested_resolution,
         def on_open():
             if channel.label == "control":
                 video = video_settings(quality, pipeline.rate.cap)
-                channel.send(json.dumps({"type": "host_info", "captureMode": CAPTURE_MODE,
+                channel.send(json.dumps({"type": "host_info", "captureMode": CAPTURE_LABEL,
+                                         "hostPlatform": "macOS" if IS_MAC else "Windows",
                                          "hostBuild": BUILD_VERSION,
                                          "fps": FPS, "targetWidth": selected["width"], "targetHeight": selected["height"],
                                          "resolutionNote": selected.get("resolutionNote", ""),
@@ -1540,6 +1765,8 @@ async def create_session(request, params, remote_offer, requested_resolution,
                                          "queueRecoveryFrames": HOST_QUEUE_FRAMES,
                                          "hostPacketRate": live_track.sent_rate(),
                                          "gop": GOP, "vbvBuffer": video["buffer"],
+                                         "encoder": selected.get("encoder"),
+                                         "multipass": NVENC_MULTIPASS if selected.get("encoder") == "nvenc" else None,
                                          "inputAdmin": is_admin(), "mouseState": host_mouse_state(selected),
                                          "playoutMaxMs": PLAYOUT_MAX_MS if playout and playout.extension_id else None,
                                          "videoProfile": "baseline",
@@ -1602,7 +1829,7 @@ async def create_session(request, params, remote_offer, requested_resolution,
                 moved = any(current[field] != selected[field]
                             for field in ("adapter", "output", "name", "bounds"))
             except Exception as exc:
-                print(f"[{session_id}] Virtual display unavailable: {exc}")
+                print(f"[{session_id}] Selected display unavailable: {exc}")
                 moved = True
             if moved or pipeline.capture.proc.poll() is not None:
                 print(f"[{session_id}] Capture layout changed; asking client to reconnect.")
@@ -1682,8 +1909,8 @@ def desktop_gui():
 
     global QUALITY_MODE, AUDIO_ENABLED
     root = tk.Tk()
-    root.title("DK Remote — Windows host")
-    root.geometry("560x640")
+    root.title("DK Remote — " + ("macOS" if IS_MAC else "Windows") + " host")
+    root.geometry("560x680" if IS_MAC else "560x670")
     root.minsize(500, 620)
     root.configure(padx=20, pady=16)
     events = queue.Queue()
@@ -1695,17 +1922,20 @@ def desktop_gui():
     closing = False
     quality = tk.StringVar(value=QUALITY_MODE)
     audio = tk.BooleanVar(value=AUDIO_ENABLED)
-    status = tk.StringVar(value="Starting host…")
-    display = tk.StringVar(value="Checking virtual display…")
+    status = tk.StringVar(value="Choose a Mac screen, then press Start host." if IS_MAC else
+                          "Starting host and tunnel…")
+    display = tk.StringVar(value="Checking display…")
     url = tk.StringVar(value="Waiting for tunnel…")
 
     ttk.Label(root, text="DK Remote", font=("Segoe UI", 22, "bold")).pack(anchor="w")
-    ttk.Label(root, text="Virtual display resolution automatically follows the controller's screen.").pack(anchor="w", pady=(0, 14))
+    ttk.Label(root, text=("Matching the receiver's pixels gives the sharpest picture; other Mac display sizes work."
+                          if IS_MAC else "The saved display starts automatically. Stop host to change it; Virtual is optional.")).pack(anchor="w", pady=(0, 14))
     ttk.Label(root, textvariable=status, wraplength=490).pack(anchor="w", pady=(0, 10))
     ttk.Label(root, textvariable=display, wraplength=490).pack(anchor="w", pady=(0, 12))
     elevated = is_admin()
-    permission_text = ("Input: administrator — Task Manager and elevated games supported"
-                       if elevated else "Input: standard user — Task Manager may block control")
+    permission_text = ("Input: grant Terminal/Python Accessibility in macOS Privacy & Security" if IS_MAC else
+                       "Input: administrator — Task Manager and elevated games supported" if elevated else
+                       "Input: standard user — Task Manager may block control")
     ttk.Label(root, text=permission_text, wraplength=490).pack(anchor="w", pady=(0, 8))
 
     def restart_admin():
@@ -1717,52 +1947,88 @@ def desktop_gui():
         except Exception as exc:
             status.set("Could not restart as administrator: " + str(exc))
 
-    if not elevated:
+    if not IS_MAC and not elevated:
         ttk.Button(root, text="Restart as administrator", command=restart_admin).pack(fill="x", pady=(0, 12))
     options = ttk.Frame(root)
     options.pack(fill="x")
     ttk.Label(options, text="Picture quality").grid(row=0, column=0, sticky="w", padx=(0, 14))
     preset = ttk.Combobox(options, textvariable=quality, values=("sharp", "balanced"), state="readonly", width=15)
     preset.grid(row=0, column=1, sticky="w")
-    audio_box = ttk.Checkbutton(options, text="Send PC speaker audio", variable=audio)
+    audio_box = ttk.Checkbutton(options, text="Send host speaker audio", variable=audio)
     audio_box.grid(row=1, column=0, columnspan=2, sticky="w", pady=10)
-    try:
-        import soundcard  # noqa: F401
-        audio_message = "Audio capture ready (Windows default speaker)"
-    except Exception:
-        audio_message = "For audio: python3 -m pip install soundcard numpy"
+    mac_audio_ready = False
+    if IS_MAC:
+        try:
+            import soundcard as sc
+            mac_audio_ready = sc.get_microphone(MAC_AUDIO_DEVICE) is not None
+        except Exception:
+            pass
+        if mac_audio_ready:
+            audio_message = f"Mac audio ready: {MAC_AUDIO_DEVICE} input. Route system sound to it."
+        else:
+            audio.set(False)
+            audio_box.configure(state="disabled")
+            audio_message = f"For Mac speaker audio, install BlackHole 2ch and route sound to it ({MAC_AUDIO_DEVICE})."
+    else:
+        try:
+            import soundcard  # noqa: F401
+            audio_message = "Audio capture ready (Windows default speaker)"
+        except Exception:
+            audio_message = "For audio: python3 -m pip install soundcard numpy"
     ttk.Label(root, text=audio_message, wraplength=490).pack(anchor="w")
 
-    ttk.Label(root, text="Chromebook address", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(9, 2))
+    if IS_MAC:
+        screen_choice = tk.IntVar(value=MAC_SCREEN_INDEX)
+        ttk.Label(options, text="Mac screen index").grid(row=2, column=0, sticky="w")
+        screen_picker = ttk.Spinbox(options, from_=0, to=31, textvariable=screen_choice, width=5)
+        screen_picker.grid(row=2, column=1, sticky="w")
+        ttk.Label(root, text="Use a virtual screen for a different receiver size; Refresh display status after choosing it.",
+                  wraplength=490).pack(anchor="w")
+    else:
+        display_choice = tk.StringVar(value=CAPTURE_DISPLAY)
+        ttk.Label(options, text="Capture display").grid(row=2, column=0, sticky="w")
+        display_picker = ttk.Combobox(options, textvariable=display_choice,
+                                      values=("primary", "virtual", "manual"), state="readonly", width=15)
+        display_picker.grid(row=2, column=1, sticky="w")
+
+    ttk.Label(root, text="Connection link — copy this one value", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(9, 2))
     address = ttk.Entry(root, textvariable=url, state="readonly")
     address.pack(fill="x")
-    ttk.Label(root, text="Connection secret", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(12, 2))
-    secret_entry = ttk.Entry(root, show="•")
-    secret_entry.insert(0, SECRET)
-    secret_entry.configure(state="readonly")
-    secret_entry.pack(fill="x")
 
     def copy(value):
         root.clipboard_clear()
         root.clipboard_append(value)
         root.update_idletasks()
 
-    def copy_address():
+    def copy_link():
         if url.get().startswith("https://"):
             copy(url.get())
 
     buttons = ttk.Frame(root)
     buttons.pack(fill="x", pady=12)
-    ttk.Button(buttons, text="Copy address", command=copy_address).pack(side="left", padx=(0, 8))
-    ttk.Button(buttons, text="Copy secret", command=lambda: copy(SECRET)).pack(side="left")
-    ttk.Label(root, text="On the Chromebook: open the address, paste the secret, press Connect.\nHold Alt for 1 second to show or hide the menu and mouse-lock button.", wraplength=490).pack(anchor="w", pady=(2, 14))
+    ttk.Button(buttons, text="Copy connection link", command=copy_link).pack(side="left", padx=(0, 8))
+    ttk.Label(root, text="On the receiving device: open the link, then press Open in about:blank.\nHold Alt for half a second to show or hide the menu.", wraplength=490).pack(anchor="w", pady=(2, 14))
 
     def check_display():
         try:
+            if IS_MAC:
+                globals()["MAC_SCREEN_INDEX"] = screen_choice.get()
+            else:
+                globals()["CAPTURE_DISPLAY"] = display_choice.get()
             chosen = select_capture_display()
-            display.set(f'Virtual display: {chosen["name"]}  •  {chosen["width"]}×{chosen["height"]}  •  automatic')
+            if IS_MAC:
+                display.set(f'Mac display: {chosen["name"]}  •  {chosen["width"]}×{chosen["height"]} native pixels')
+            else:
+                label = {"primary": "Primary display", "virtual": "Virtual display", "manual": "Manual display"}[CAPTURE_DISPLAY]
+                suffix = "  •  matches receiver when possible" if CAPTURE_DISPLAY == "virtual" else "  •  native capture"
+                display.set(f'{label}: {chosen["name"]}  •  {chosen["width"]}×{chosen["height"]}{suffix}')
+            return True
         except Exception as exc:
-            display.set("Virtual display: " + str(exc))
+            display.set("Display: " + str(exc))
+            return False
+
+    if not IS_MAC:
+        display_picker.bind("<<ComboboxSelected>>", lambda _event: check_display())
 
     def server_worker():
         nonlocal server_loop, server_stop
@@ -1775,7 +2041,7 @@ def desktop_gui():
             runner = web.AppRunner(make_app(), access_log=None)
             await runner.setup()
             try:
-                await web.TCPSite(runner, HOST, PORT).start()
+                await web.TCPSite(runner, BIND_HOST, PORT).start()
                 events.put(("ready", None))
                 await server_stop.wait()
             finally:
@@ -1791,26 +2057,37 @@ def desktop_gui():
             events.put(("stopped", None))
 
     def tunnel_reader(process):
-        found = False
+        last_error = ""
         try:
             for line in iter(process.stdout.readline, b""):
                 message = line.decode(errors="replace").rstrip()
                 print("[cloudflared]", message)
-                match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", message)
-                if match:
-                    found = True
-                    events.put(("url", match.group(0)))
+                address = quick_tunnel_url(message)
+                if address:
+                    events.put(("url", (process, address)))
+                if " ERR " in message or "failed to " in message.lower():
+                    last_error = message[:300]
             code = process.wait()
-            if not found:
-                events.put(("tunnel_error", f"Tunnel exited ({code}); check the [cloudflared] console lines."))
+            detail = f"Cloudflare tunnel exited ({code})."
+            if last_error:
+                detail += " " + last_error
+            events.put(("tunnel_error", (process, detail)))
         except Exception as exc:
-            events.put(("tunnel_error", str(exc)))
+            events.put(("tunnel_error", (process, str(exc))))
 
     def start_tunnel():
         nonlocal tunnel
         exe = shutil.which("cloudflared")
+        if not exe and os.name == "nt":
+            for variable in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
+                folder = os.environ.get(variable)
+                if folder:
+                    candidate = Path(folder) / "cloudflared" / "cloudflared.exe"
+                    if candidate.is_file():
+                        exe = str(candidate)
+                        break
         if not exe:
-            status.set("Host ready. Run cloudflared tunnel --url http://127.0.0.1:8765 in PowerShell.")
+            status.set("Host ready, but cloudflared was not found. Run the setup script, then restart DK Remote.")
             return
         try:
             flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -1830,13 +2107,22 @@ def desktop_gui():
         globals()["QUALITY_MODE"] = quality.get()
         globals()["AUDIO_ENABLED"] = audio.get()
         try:
-            SETTINGS_FILE.write_text(json.dumps({"quality": quality.get(), "audio": audio.get()}), encoding="utf-8")
+            settings = {"quality": quality.get(), "audio": audio.get()}
+            if not IS_MAC:
+                settings["display"] = display_choice.get()
+            SETTINGS_FILE.write_text(json.dumps(settings), encoding="utf-8")
         except OSError as exc:
             print("[settings] Could not save UI choices:", exc)
-        check_display()
+        if not check_display():
+            status.set("Selected display is unavailable. See the display status above.")
+            return
         running = True
         preset.configure(state="disabled")
         audio_box.configure(state="disabled")
+        if IS_MAC:
+            screen_picker.configure(state="disabled")
+        else:
+            display_picker.configure(state="disabled")
         start_button.configure(text="Stop host")
         status.set("Starting signaling server…")
         url.set("Waiting for tunnel…")
@@ -1877,16 +2163,25 @@ def desktop_gui():
                     start_tunnel()
                 elif server_loop and server_stop:
                     server_loop.call_soon_threadsafe(server_stop.set)
-            elif kind == "url" and running:
-                url.set(value)
-                status.set("Ready. Open this address on the Chromebook.")
-            elif kind in ("error", "tunnel_error") and running:
+            elif kind == "url" and running and value[0] is tunnel:
+                url.set(connection_link(value[1]))
+                status.set("Ready. Copy the connection link to the receiving device.")
+            elif kind == "tunnel_error" and running and value[0] is tunnel:
+                url.set("Tunnel unavailable")
+                status.set(value[1])
+            elif kind == "error" and running:
                 status.set(value)
             elif kind == "stopped":
                 running = False
                 start_button.configure(state="normal", text="Start host")
                 preset.configure(state="readonly")
-                audio_box.configure(state="normal")
+                if IS_MAC:
+                    screen_picker.configure(state="normal")
+                    if mac_audio_ready:
+                        audio_box.configure(state="normal")
+                else:
+                    display_picker.configure(state="readonly")
+                    audio_box.configure(state="normal")
                 if not closing and status.get() == "Stopping…":
                     status.set("Host stopped.")
         if not closing:
@@ -1910,12 +2205,16 @@ def desktop_gui():
             root.after(2500, refresh_display)
     refresh_display()
     poll()
-    root.after(100, start)
+    if not IS_MAC:
+        root.after(100, start)
     root.mainloop()
 
 
 def main():
     global FFMPEG_EXE
+
+    if os.name != "nt" and not IS_MAC:
+        raise RuntimeError("The host supports Windows and macOS. The receiver works in any compatible browser.")
     if os.name == "nt" and not is_admin() and os.environ.get("DK_ALLOW_STANDARD_INPUT") != "1":
         # Ask before there is an active stream. A remote-only UAC prompt would
         # otherwise strand the user when Task Manager takes the foreground.
@@ -1955,37 +2254,42 @@ def main():
         raise
     FFMPEG_EXE = exe
     print("\n============================================================")
-    print(" DK REMOTE - WEBRTC + DXGI + NVENC (LOW LATENCY)")
+    print(" DK REMOTE - WEBRTC + HARDWARE H.264")
     print(f" Build            : {BUILD_VERSION}")
     print("============================================================")
-    print(f" Signaling server : http://{HOST}:{PORT}")
-    print(f" Capture          : DXGI Desktop Duplication / {FPS} FPS")
-    print(f" Display          : {'auto MttVDD virtual monitor' if CAPTURE_DISPLAY == 'virtual' else f'manual DXGI output_idx={DISPLAY_OUTPUT_INDEX}'}")
-    print(f" Target           : controller screen resolution (automatic) @ {FPS} FPS")
-    print(f" Frame path       : {'D3D11 direct to NVENC (no scaler)' if CAPTURE_MODE == 'direct' else 'CPU resize to NV12 + NVENC'}")
-    if CAPTURE_MODE == "direct":
+    print(f" Signaling server : http://{BIND_HOST}:{PORT}")
+    print(f" Capture          : {'AVFoundation' if IS_MAC else 'DXGI Desktop Duplication'} / {FPS} FPS")
+    print(f" Display          : {f'Mac screen {MAC_SCREEN_INDEX}' if IS_MAC else 'Windows primary display' if CAPTURE_DISPLAY == 'primary' else 'auto MttVDD virtual monitor' if CAPTURE_DISPLAY == 'virtual' else f'manual DXGI adapter={DISPLAY_ADAPTER_INDEX} output={DISPLAY_OUTPUT_INDEX}'}")
+    print(f" Target           : native host pixels @ {FPS} FPS; receiver fits mismatches")
+    print(f" Frame path       : {'native pixels to VideoToolbox' if IS_MAC else 'D3D11 direct (no scaler)' if CAPTURE_MODE == 'direct' else 'CPU pixel-format conversion (no scaler)'}")
+    if not IS_MAC and CAPTURE_DISPLAY == "virtual":
         print(" Virtual mode     : Windows resolution is chosen automatically when a controller connects.")
+    if IS_MAC:
+        print(" Mac display      : matching the receiver pixels is optional but sharper.")
     video = video_settings(QUALITY_MODE)
-    print(f" Encoder          : h264_nvenc p4 ULL / {EFFECTIVE_RATE_MODE} / {video['bitrate']} target / "
-          f"{video['maxrate'] if EFFECTIVE_RATE_MODE == 'vbr' else video['bitrate']} ceiling / {video['buffer']} VBV / {GOP}-frame GOP")
-    print(f" Playout hint     : 0–{PLAYOUT_MAX_MS} ms (browser best effort)")
+    print(f" Encoder options  : {', '.join(ENCODER_CANDIDATES)} / {EFFECTIVE_RATE_MODE} / "
+          f"{video['bitrate']} target / {video['maxrate'] if EFFECTIVE_RATE_MODE == 'vbr' else video['bitrate']} ceiling / "
+          f"{video['buffer']} VBV / {GOP}-frame GOP")
+    print(f" Playout hint     : 0-{PLAYOUT_MAX_MS} ms (browser best effort)")
     print(f" Video pipe       : {'complete frames / no parser lookahead' if LOW_DELAY_DEMUX else 'legacy H.264 parser'}")
-    print(f" Input permission : {'administrator' if is_admin() else 'standard user; use Restart as administrator for Task Manager'}")
-    print(" Chromebook secret:")
-    print(SECRET)
-    print("\n In another PowerShell:")
+    print(f" Input permission : {'Accessibility in macOS System Settings' if IS_MAC else 'administrator' if is_admin() else 'standard user; use Restart as administrator for Task Manager'}")
+    print(" Connection link : appears in the host window when the tunnel is ready")
+    print("\n In another terminal:")
     print(f" cloudflared tunnel --url http://{HOST}:{PORT}")
-    print(" Open the cloudflared URL on your Chromebook and enter the secret above.")
-    try:
-        import soundcard  # noqa: F401
-        print(" Audio            : Windows default speaker (WASAPI loopback)")
-    except Exception:
-        print(" Audio            : install with python3 -m pip install soundcard numpy")
+    print(" Open the connection link in the receiving browser, then choose about:blank.")
+    if IS_MAC:
+        print(f" Audio            : optional {MAC_AUDIO_DEVICE} input (BlackHole/Multi-Output Device)")
+    else:
+        try:
+            import soundcard  # noqa: F401
+            print(" Audio            : Windows default speaker (WASAPI loopback)")
+        except Exception:
+            print(" Audio            : install with python3 -m pip install soundcard numpy")
     print("============================================================\n")
-    if os.name == "nt" and os.environ.get("DK_NO_GUI") != "1":
+    if (os.name == "nt" or IS_MAC) and os.environ.get("DK_NO_GUI") != "1":
         desktop_gui()
     else:
-        web.run_app(make_app(), host=HOST, port=PORT, access_log=None, print=None)
+        web.run_app(make_app(), host=BIND_HOST, port=PORT, access_log=None, print=None)
 
 
 if __name__ == "__main__":
