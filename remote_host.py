@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import uuid
+import zlib
 from collections import deque
 from pathlib import Path
 
@@ -31,7 +32,7 @@ from pynput.mouse import Controller as MouseController, Button
 HOST = "127.0.0.1"
 BIND_HOST = os.environ.get("DK_BIND_HOST", HOST)
 PORT = 8765
-BUILD_VERSION = "2026.10.24.3"
+BUILD_VERSION = "2026.10.24.5"
 IS_MAC = sys.platform == "darwin"
 FPS = int(os.environ.get("DK_FPS", "60"))
 WIDTH = 1366
@@ -107,7 +108,8 @@ keyboard = KeyboardController()
 mouse = MouseController()
 escape_task = None
 PLAYOUT_URI = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay"
-PLAYOUT_MAX_MS = max(0, min(40950, int(os.environ.get("DK_PLAYOUT_MAX_MS", "80")))) // 10 * 10
+# This is a browser hint, not a fixed queue or an enforced latency ceiling.
+PLAYOUT_MAX_MS = max(0, min(40950, int(os.environ.get("DK_PLAYOUT_MAX_MS", "40")))) // 10 * 10
 HOST_QUEUE_MS = max(0, int(os.environ.get("DK_HOST_QUEUE_MS", "50")))
 HOST_QUEUE_FRAMES = max(2, math.ceil(FPS * HOST_QUEUE_MS / 1000))
 # One FFmpeg video frame per PES packet, with its own timestamp. Avoid the
@@ -167,6 +169,12 @@ def connection_link(address):
     if not match:
         raise ValueError("Expected a Cloudflare tunnel address")
     return "https://" + match.group(1) + "/#" + connection_code(match.group(1))
+
+
+def connection_blob(address):
+    """One portable value containing the tunnel address and its access proof."""
+    compressed = zlib.compress(connection_link(address).encode("utf-8"), level=9)
+    return "dk2." + base64.urlsafe_b64encode(compressed).decode("ascii").rstrip("=")
 
 
 class LowDelayExtensions:
@@ -1991,7 +1999,7 @@ def desktop_gui():
                                       values=("primary", "virtual", "manual"), state="readonly", width=15)
         display_picker.grid(row=2, column=1, sticky="w")
 
-    ttk.Label(root, text="Connection link — copy this one value", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(9, 2))
+    ttk.Label(root, text="Connection blob — copy this one value", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(9, 2))
     address = ttk.Entry(root, textvariable=url, state="readonly")
     address.pack(fill="x")
 
@@ -2001,13 +2009,13 @@ def desktop_gui():
         root.update_idletasks()
 
     def copy_link():
-        if url.get().startswith("https://"):
+        if url.get().startswith("dk2."):
             copy(url.get())
 
     buttons = ttk.Frame(root)
     buttons.pack(fill="x", pady=12)
-    ttk.Button(buttons, text="Copy connection link", command=copy_link).pack(side="left", padx=(0, 8))
-    ttk.Label(root, text="On the receiving device: open the link, then press Open in about:blank.\nHold Alt for half a second to show or hide the menu.", wraplength=490).pack(anchor="w", pady=(2, 14))
+    ttk.Button(buttons, text="Copy connection blob", command=copy_link).pack(side="left", padx=(0, 8))
+    ttk.Label(root, text="Open the HTML receiver and paste this blob into its terminal.\nFor a latency estimate, enter: es <blob>\nHold Alt for half a second during streaming for the menu.", wraplength=490).pack(anchor="w", pady=(2, 14))
 
     def check_display():
         try:
@@ -2164,8 +2172,8 @@ def desktop_gui():
                 elif server_loop and server_stop:
                     server_loop.call_soon_threadsafe(server_stop.set)
             elif kind == "url" and running and value[0] is tunnel:
-                url.set(connection_link(value[1]))
-                status.set("Ready. Copy the connection link to the receiving device.")
+                url.set(connection_blob(value[1]))
+                status.set("Ready. Copy the connection blob to the receiving device.")
             elif kind == "tunnel_error" and running and value[0] is tunnel:
                 url.set("Tunnel unavailable")
                 status.set(value[1])
@@ -2273,10 +2281,10 @@ def main():
     print(f" Playout hint     : 0-{PLAYOUT_MAX_MS} ms (browser best effort)")
     print(f" Video pipe       : {'complete frames / no parser lookahead' if LOW_DELAY_DEMUX else 'legacy H.264 parser'}")
     print(f" Input permission : {'Accessibility in macOS System Settings' if IS_MAC else 'administrator' if is_admin() else 'standard user; use Restart as administrator for Task Manager'}")
-    print(" Connection link : appears in the host window when the tunnel is ready")
+    print(" Connection blob : appears in the host window when the tunnel is ready")
     print("\n In another terminal:")
     print(f" cloudflared tunnel --url http://{HOST}:{PORT}")
-    print(" Open the connection link in the receiving browser, then choose about:blank.")
+    print(" Open remote_client_low_latency.html and paste the blob into its terminal.")
     if IS_MAC:
         print(f" Audio            : optional {MAC_AUDIO_DEVICE} input (BlackHole/Multi-Output Device)")
     else:
